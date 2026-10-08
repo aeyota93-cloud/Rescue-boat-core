@@ -85,6 +85,9 @@ func makeTunnelConfig(in *TunnelStartRequest) option.Options {
 					DefaultOptions: option.DefaultRule{
 						RawDefaultRule: option.RawDefaultRule{
 							ProcessName: []string{
+								// Шлюпка: своё приложение мимо туннеля, иначе трафик пойдёт по кругу.
+								"RescueBoat.exe",
+								"RescueBoat",
 								"Hiddify.exe",
 								"Hiddify",
 								"HiddifyCli",
