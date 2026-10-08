@@ -155,7 +155,7 @@ func TestUserRules(t *testing.T) {
 	hopt.Rules = []Rule{
 		{Enabled: true, ListOrder: 2, Outbound: Outbound_direct, ProcessNames: []string{"Telegram.exe"}},
 		{Enabled: true, ListOrder: 1, Outbound: Outbound_block, DomainSuffixes: []string{"tracker.example"}},
-		{Enabled: true, ListOrder: 3, Outbound: Outbound_proxy, RuleSets: []string{"geosite:ru", "https://example.com/my.srs", "мусор"}, PortRanges: []string{"443", "1000:2000"}},
+		{Enabled: true, ListOrder: 3, Outbound: Outbound_proxy, RuleSets: []string{"geosite:ru", "https://example.com/my.srs", "мусор"}, PortRanges: []string{"443", "1000:2000", "3000-4000", "плохо"}},
 		{Enabled: false, Outbound: Outbound_direct, ProcessNames: []string{"disabled.exe"}},
 		{Enabled: true, Outbound: Outbound_direct}, // без условий: пропускается
 	}
@@ -193,7 +193,7 @@ func TestUserRules(t *testing.T) {
 		t.Errorf("нет набора user-geosite-ru: %v", sets)
 	}
 	ports := findRouteRule(o, func(r option.DefaultRule) bool { return slices.Contains(r.RuleSet, "user-geosite-ru") })
-	if ports == nil || !slices.Contains(ports.Port, uint16(443)) || !slices.Contains(ports.PortRange, "1000:2000") {
+	if ports == nil || !slices.Contains(ports.Port, uint16(443)) || !slices.Contains(ports.PortRange, "1000:2000") || !slices.Contains(ports.PortRange, "3000:4000") || len(ports.PortRange) != 2 {
 		t.Errorf("порты разобраны неверно: %+v", ports)
 	}
 	if len(ports.RuleSet) != 2 {

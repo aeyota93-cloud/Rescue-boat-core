@@ -206,15 +206,21 @@ func userRuleSetSource(src string) (tag, url string) {
 	return "", ""
 }
 
-// splitPorts: «443» → port, «1000:2000» → port_range.
+// splitPorts: «443» → port, «1000:2000» и «1000-2000» (так подсказывает приложение) → port_range.
 func splitPorts(items []string) (ports badoption.Listable[uint16], ranges badoption.Listable[string]) {
 	for _, item := range items {
 		item = strings.TrimSpace(item)
 		if item == "" {
 			continue
 		}
-		if strings.Contains(item, ":") {
-			ranges = append(ranges, item)
+		if from, to, ok := strings.Cut(strings.ReplaceAll(item, "-", ":"), ":"); ok {
+			if _, err := strconv.ParseUint(from, 10, 16); err != nil {
+				continue
+			}
+			if _, err := strconv.ParseUint(to, 10, 16); err != nil {
+				continue
+			}
+			ranges = append(ranges, from+":"+to)
 		} else if p, err := strconv.ParseUint(item, 10, 16); err == nil {
 			ports = append(ports, uint16(p))
 		}
