@@ -74,6 +74,24 @@ func parseConfigContent(ctx context.Context, content []byte, debug bool, configO
 					if tmpJsonObj["endpoints"] != nil {
 						jsonObj["endpoints"] = tmpJsonObj["endpoints"]
 					}
+					// Шлюпка: правила сервера (route, dns) сохраняются в профиле,
+					// их применяет serverRules в rescue_rules.go.
+					withServerRules := false
+					for _, key := range []string{"route", "dns"} {
+						if tmpJsonObj[key] != nil {
+							jsonObj[key] = tmpJsonObj[key]
+							withServerRules = true
+						}
+					}
+					if withServerRules {
+						newContent, _ := json.MarshalIndent(jsonObj, "", "  ")
+						if options, err := patchConfigStr(ctx, newContent, "SingboxParser", configOpt); err == nil {
+							return options, nil
+						}
+						// Чужая подписка с правилами, которые это ядро не понимает: только серверы.
+						delete(jsonObj, "route")
+						delete(jsonObj, "dns")
+					}
 				}
 			}
 		} else if jsonArray, ok := tmpJsonResult.([]map[string]interface{}); ok {

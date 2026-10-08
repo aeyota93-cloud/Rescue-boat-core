@@ -89,7 +89,7 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 		return nil, err
 	}
 
-	if err := setRoutingOptions(&options, hopts); err != nil {
+	if err := setRoutingOptions(&options, hopts, input); err != nil {
 		return nil, err
 	}
 
@@ -562,7 +562,7 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 	}
 }
 
-func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
+func setRoutingOptions(options *option.Options, hopt *HiddifyOptions, input *option.Options) error {
 	dnsRules := []option.DefaultDNSRule{}
 	routeRules := []option.Rule{}
 	rulesets := []option.RuleSet{}
@@ -724,6 +724,12 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 	// 	}
 	// 	dnsRules = append(dnsRules, dnsRule)
 	// }
+	// Шлюпка: правила пользователя и правила из подписки (rescue_rules.go).
+	rescue := buildRescueRules(input, hopt)
+	routeRules = append(routeRules, rescue.route...)
+	dnsRules = append(dnsRules, rescue.dns...)
+	rulesets = append(rulesets, rescue.ruleSets...)
+
 	forceDirectRoute := make([]string, 0)
 	if options.NTP != nil && options.NTP.Enabled {
 		forceDirectRoute = append(forceDirectRoute, options.NTP.Server)
@@ -987,7 +993,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 		},
 		// OverrideAndroidVPN: hopt.EnableTun && C.IsAndroid,
 		RuleSet:     rulesets,
-		FindProcess: false,
+		FindProcess: rescue.findProcess,
 		// GeoIP: &option.GeoIPOptions{
 		// 	Path: opt.GeoIPPath,
 		// },
