@@ -44,9 +44,14 @@ jobs:
 
       - name: Архив
         working-directory: bin
+        # Makefile Hiddify (.ONESHELL без set -e) не останавливается на ошибке внутри рецепта:
+        # в v4.1.0-rb.4 сорвалось скачивание libcronet.dll, а релиз вышел без него.
         run: |
+          for f in hiddify-core.dll libcronet.dll HiddifyCli.exe; do
+            [ -s "$f" ] || { echo "::error::нет $f — сборка ядра неполная"; exit 1; }
+          done
           mkdir -p ../out
-          tar -czvf ../out/hiddify-lib-windows-amd64.tar.gz $(find . -name hiddify-core.dll -o -name libcronet.dll -o -name HiddifyCli.exe)
+          tar -czvf ../out/hiddify-lib-windows-amd64.tar.gz ./hiddify-core.dll ./libcronet.dll ./HiddifyCli.exe
 
       - uses: actions/upload-artifact@v6
         with:
