@@ -1,0 +1,64 @@
+# Сборка ядра «Шлюпки спасения» (форк hiddify-core) для Windows.
+# Ядро собирается на Linux кросс-компилятором MinGW, как у Hiddify.
+#  - push в main: сборка, архив в артефакте запуска 7 дней;
+#  - тег vX.Y.Z[-...]: то же плюс релиз с hiddify-lib-windows-amd64.tar.gz.
+#    Приложение (Rescue-boat) скачивает ядро из этого релиза: core.version в dependencies.properties.
+name: Windows core
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      # Подмодули с адресами git@github.com: checkout сам переводит на https.
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: MinGW
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
+
+      - name: Сборка hiddify-core.dll и HiddifyCli.exe
+        env:
+          CODE_VERSION: -X github.com/hiddify/hiddify-core/v2/hcommon/constants.Version=${{ github.ref_name }}
+        run: make windows-amd64
+
+      - name: Архив
+        working-directory: bin
+        run: |
+          mkdir -p ../out
+          tar -czvf ../out/hiddify-lib-windows-amd64.tar.gz $(find . -name hiddify-core.dll -o -name libcronet.dll -o -name HiddifyCli.exe)
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: hiddify-lib-windows-amd64
+          path: out
+          retention-days: 7
+
+      - name: Релиз
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          extra=()
+          [[ "${{ github.ref_name }}" == *-* ]] && extra+=(--prerelease)
+          gh release create "${{ github.ref_name }}" out/* --title "${{ github.ref_name }}" --generate-notes "${extra[@]}"
