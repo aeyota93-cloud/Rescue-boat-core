@@ -23,14 +23,14 @@ type HiddifyOptions struct {
 	BalancerStrategy        string `json:"balancer-strategy,omitempty" overridable:"true"`
 	// GeoIPPath        string      `json:"geoip-path"`
 	// GeoSitePath      string      `json:"geosite-path"`
-	Rules     []Rule      `json:"rules,omitempty" overridable:"true"`
+	Rules []Rule `json:"rules,omitempty" overridable:"true"`
 	// Шлюпка: не брать правила маршрутов из подписки (по умолчанию берутся).
-	IgnoreServerRules bool `json:"ignore-server-rules,omitempty"`
-	Warp      WarpOptions `json:"warp,omitempty"`
-	Warp2     WarpOptions `json:"warp2,omitempty"`
-	Mux       MuxOptions  `json:"mux,omitempty" overridable:"true"`
-	TLSTricks TLSTricks   `json:"tls-tricks,omitempty"`
-	EnableNTP bool        `json:"enable-ntp,omitempty"`
+	IgnoreServerRules bool        `json:"ignore-server-rules,omitempty"`
+	Warp              WarpOptions `json:"warp,omitempty"`
+	Warp2             WarpOptions `json:"warp2,omitempty"`
+	Mux               MuxOptions  `json:"mux,omitempty" overridable:"true"`
+	TLSTricks         TLSTricks   `json:"tls-tricks,omitempty"`
+	EnableNTP         bool        `json:"enable-ntp,omitempty"`
 
 	DNSOptions
 	InboundOptions
