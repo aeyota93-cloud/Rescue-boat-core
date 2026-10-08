@@ -5,6 +5,7 @@ import (
 	"slices"
 	"testing"
 
+	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/experimental/libbox"
 	"github.com/sagernet/sing-box/option"
 )
@@ -229,5 +230,36 @@ func TestBrokenServerRulesFallBack(t *testing.T) {
 	}
 	if parsed.DNS != nil && len(parsed.DNS.Servers) > 0 {
 		t.Error("непонятный DNS должен быть отброшен")
+	}
+}
+
+func TestIPv4OnlyMode(t *testing.T) {
+	hopt := DefaultHiddifyOptions()
+	hopt.EnableTun = true
+	hopt.IPv6Mode = option.DomainStrategy(C.DomainStrategyIPv4Only)
+	o := buildTestConfig(t, testSubscription, hopt)
+
+	tuns := 0
+	for _, in := range o.Inbounds {
+		tun, ok := in.Options.(*option.TunInboundOptions)
+		if !ok {
+			continue
+		}
+		tuns++
+		for _, p := range tun.Address {
+			if p.Addr().Is6() {
+				t.Errorf("IPv6 выключен, а у туннеля адрес %s", p)
+			}
+		}
+	}
+	if tuns != 1 {
+		t.Fatalf("ожидался один туннель, найдено %d", tuns)
+	}
+	last := o.DNS.Rules[len(o.DNS.Rules)-1].DefaultOptions
+	if last.RouteOptions.Strategy != option.DomainStrategy(C.DomainStrategyIPv4Only) {
+		t.Errorf("DNS должен отдавать только IPv4: %v", last.RouteOptions.Strategy)
+	}
+	if hopt.RemoteDnsDomainStrategy != option.DomainStrategy(C.DomainStrategyAsIS) {
+		t.Error("BuildConfig не должен менять настройки вызывающего")
 	}
 }

@@ -373,3 +373,26 @@ func serverRules(input *option.Options, hopt *HiddifyOptions) rescueRules {
 	}
 	return res
 }
+
+// ---------- IPv6 ----------
+
+// ipv4Only: IPv6 выключен в приложении («Режим IPv6: выключен», так по умолчанию).
+// Hiddify эту настройку не применял: туннель получал IPv6-адрес, DNS отдавал AAAA,
+// и программы шли на IPv6-адреса, которых нет ни у сервера, ни у многих провайдеров.
+// Браузер после паузы переходил на IPv4, другие программы просто не работали.
+func ipv4Only(hopt *HiddifyOptions) bool {
+	return hopt.IPv6Mode == option.DomainStrategy(C.DomainStrategyIPv4Only)
+}
+
+func applyIPv6Mode(hopt *HiddifyOptions) {
+	if !ipv4Only(hopt) {
+		return
+	}
+	asIs := option.DomainStrategy(C.DomainStrategyAsIS)
+	if hopt.RemoteDnsDomainStrategy == asIs {
+		hopt.RemoteDnsDomainStrategy = hopt.IPv6Mode
+	}
+	if hopt.DirectDnsDomainStrategy == asIs {
+		hopt.DirectDnsDomainStrategy = hopt.IPv6Mode
+	}
+}

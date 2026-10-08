@@ -67,6 +67,10 @@ func BuildConfig(ctx context.Context, hopts *HiddifyOptions, inputOpt *ReadOptio
 	if err != nil {
 		return nil, err
 	}
+	// Шлюпка: копия, чтобы правки ниже не меняли настройки вызывающего.
+	normalized := *hopts
+	hopts = &normalized
+	applyIPv6Mode(hopts)
 
 	var options option.Options
 	if hopts.EnableFullConfig {
@@ -437,7 +441,7 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 	// } else {
 	// 	inboundDomainStrategy = opt.IPv6Mode
 	// }
-	ipv6Enable := isIPv6Supported()
+	ipv6Enable := isIPv6Supported() && !ipv4Only(hopt)
 	if hopt.EnableTun {
 
 		opts := option.TunInboundOptions{
