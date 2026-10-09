@@ -70,6 +70,9 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 			},
 		},
 	}
+	// Вкладка «Сейчас в сети» показывает, какая программа куда идёт: имя процесса нужно для
+	// каждого соединения, а не только когда в списках есть программы.
+	res.findProcess = isWindows
 	res.dns = []option.DefaultDNSRule{
 		directDNSRule(hopt, option.RawDefaultDNSRule{RuleSet: []string{splitBypassDomainsTag}}),
 	}

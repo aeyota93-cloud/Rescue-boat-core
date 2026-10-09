@@ -1003,7 +1003,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions, input *opt
 		},
 		// OverrideAndroidVPN: hopt.EnableTun && C.IsAndroid,
 		RuleSet:     rulesets,
-		FindProcess: rescue.findProcess,
+		FindProcess: rescue.findProcess || split.findProcess,
 		// GeoIP: &option.GeoIPOptions{
 		// 	Path: opt.GeoIPPath,
 		// },
