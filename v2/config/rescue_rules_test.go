@@ -2,6 +2,7 @@ package config
 
 import (
 	"encoding/json"
+	"regexp"
 	"slices"
 	"testing"
 
@@ -152,6 +153,8 @@ func TestIgnoreServerRules(t *testing.T) {
 }
 
 func TestUserRules(t *testing.T) {
+	defer func(old bool) { isWindows = old }(isWindows)
+	isWindows = false
 	hopt := DefaultHiddifyOptions()
 	hopt.Rules = []Rule{
 		{Enabled: true, ListOrder: 2, Outbound: Outbound_direct, ProcessNames: []string{"Telegram.exe"}},
@@ -261,5 +264,40 @@ func TestIPv4OnlyMode(t *testing.T) {
 	}
 	if hopt.RemoteDnsDomainStrategy != option.DomainStrategy(C.DomainStrategyAsIS) {
 		t.Error("BuildConfig не должен менять настройки вызывающего")
+	}
+}
+
+func TestProcessNamesOnWindows(t *testing.T) {
+	defer func(old bool) { isWindows = old }(isWindows)
+	isWindows = true
+	hopt := DefaultHiddifyOptions()
+	hopt.Rules = []Rule{{Enabled: true, Outbound: Outbound_direct, ProcessNames: []string{"Steam.exe", "League of Legends.exe"}}}
+	o := buildTestConfig(t, testSubscription, hopt)
+
+	rule := findRouteRule(o, func(r option.DefaultRule) bool { return len(r.ProcessPathRegex) == 2 })
+	if rule == nil {
+		t.Fatal("на Windows имена программ должны стать process_path_regex")
+	}
+	if len(rule.ProcessName) != 0 || !o.Route.FindProcess {
+		t.Errorf("process_name не нужен, find_process нужен: %+v", rule)
+	}
+	matches := func(path string) bool {
+		for _, re := range rule.ProcessPathRegex {
+			if regexp.MustCompile(re).MatchString(path) {
+				return true
+			}
+		}
+		return false
+	}
+	for path, want := range map[string]bool{
+		`C:\Program Files (x86)\Steam\steam.exe`:                true,
+		`C:\Riot Games\League of Legends\League of Legends.exe`: true,
+		`C:\Program Files (x86)\Steam\notsteam.exe`:             false,
+		`C:\Program Files (x86)\Steam\steam.exe.bak`:            false,
+		`C:\Riot Games\League of Legends\League ofXLegends.exe`: false,
+	} {
+		if got := matches(path); got != want {
+			t.Errorf("%s: совпадение %v, ожидалось %v", path, got, want)
+		}
 	}
 }

@@ -12,6 +12,8 @@ package config
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -114,10 +116,10 @@ func userRules(hopt *HiddifyOptions) rescueRules {
 			DomainRegex:   r.GetDomainRegexes(),
 			IPCIDR:        r.GetIpCidrs(),
 			SourceIPCIDR:  r.GetSourceIpCidrs(),
-			ProcessName:   r.GetProcessNames(),
 			ProcessPath:   r.GetProcessPaths(),
 			PackageName:   r.GetPackageNames(),
 		}
+		raw.ProcessName, raw.ProcessPathRegex = processMatchers(r.GetProcessNames())
 		raw.Port, raw.PortRange = splitPorts(r.GetPortRanges())
 		raw.SourcePort, raw.SourcePortRange = splitPorts(r.GetSourcePortRanges())
 		switch r.GetNetwork() {
@@ -144,7 +146,7 @@ func userRules(hopt *HiddifyOptions) rescueRules {
 			// Правило без условий совпало бы со всем трафиком.
 			continue
 		}
-		if len(raw.ProcessName) > 0 || len(raw.ProcessPath) > 0 {
+		if len(raw.ProcessName) > 0 || len(raw.ProcessPath) > 0 || len(raw.ProcessPathRegex) > 0 {
 			res.findProcess = true
 		}
 
@@ -169,14 +171,15 @@ func userRules(hopt *HiddifyOptions) rescueRules {
 		// и никаких запросов к DNS через сервер для того, что идёт напрямую.
 		if direct {
 			dnsRaw := option.RawDefaultDNSRule{
-				Domain:        raw.Domain,
-				DomainSuffix:  raw.DomainSuffix,
-				DomainKeyword: raw.DomainKeyword,
-				DomainRegex:   raw.DomainRegex,
-				ProcessName:   raw.ProcessName,
-				ProcessPath:   raw.ProcessPath,
-				PackageName:   raw.PackageName,
-				RuleSet:       raw.RuleSet,
+				Domain:           raw.Domain,
+				DomainSuffix:     raw.DomainSuffix,
+				DomainKeyword:    raw.DomainKeyword,
+				DomainRegex:      raw.DomainRegex,
+				ProcessName:      raw.ProcessName,
+				ProcessPath:      raw.ProcessPath,
+				ProcessPathRegex: raw.ProcessPathRegex,
+				PackageName:      raw.PackageName,
+				RuleSet:          raw.RuleSet,
 			}
 			if hasDNSMatcher(dnsRaw) {
 				res.dns = append(res.dns, directDNSRule(hopt, dnsRaw))
@@ -184,6 +187,26 @@ func userRules(hopt *HiddifyOptions) rescueRules {
 		}
 	}
 	return res
+}
+
+// isWindows — переменная, чтобы тесты проверяли обе ветки processMatchers.
+var isWindows = runtime.GOOS == "windows"
+
+// processMatchers: в Windows имена файлов без учёта регистра, а sing-box сравнивает
+// process_name точно: «Steam.exe» в правиле не совпал бы с процессом «steam.exe».
+// Поэтому на Windows имя превращается в process_path_regex без учёта регистра.
+func processMatchers(names []string) (exact []string, pathRegex []string) {
+	if !isWindows {
+		return names, nil
+	}
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		pathRegex = append(pathRegex, `(?i)(^|[\\/])`+regexp.QuoteMeta(name)+`$`)
+	}
+	return nil, pathRegex
 }
 
 // userRuleSetSource: «https://…/x.srs» или краткая запись «geoip:ru» / «geosite:ru»
@@ -232,12 +255,12 @@ func hasMatcher(r option.RawDefaultRule) bool {
 	return len(r.Domain)+len(r.DomainSuffix)+len(r.DomainKeyword)+len(r.DomainRegex)+
 		len(r.IPCIDR)+len(r.SourceIPCIDR)+len(r.Port)+len(r.PortRange)+
 		len(r.SourcePort)+len(r.SourcePortRange)+len(r.ProcessName)+len(r.ProcessPath)+
-		len(r.PackageName)+len(r.Protocol)+len(r.RuleSet) > 0 || r.IPIsPrivate
+		len(r.ProcessPathRegex)+len(r.PackageName)+len(r.Protocol)+len(r.RuleSet) > 0 || r.IPIsPrivate
 }
 
 func hasDNSMatcher(r option.RawDefaultDNSRule) bool {
 	return len(r.Domain)+len(r.DomainSuffix)+len(r.DomainKeyword)+len(r.DomainRegex)+
-		len(r.ProcessName)+len(r.ProcessPath)+len(r.PackageName)+len(r.RuleSet) > 0
+		len(r.ProcessName)+len(r.ProcessPath)+len(r.ProcessPathRegex)+len(r.PackageName)+len(r.RuleSet) > 0
 }
 
 // ---------- правила сервера ----------
