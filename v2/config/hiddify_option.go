@@ -25,12 +25,14 @@ type HiddifyOptions struct {
 	// GeoSitePath      string      `json:"geosite-path"`
 	Rules []Rule `json:"rules,omitempty" overridable:"true"`
 	// Шлюпка: не брать правила маршрутов из подписки (по умолчанию берутся).
-	IgnoreServerRules bool        `json:"ignore-server-rules,omitempty"`
-	Warp              WarpOptions `json:"warp,omitempty"`
-	Warp2             WarpOptions `json:"warp2,omitempty"`
-	Mux               MuxOptions  `json:"mux,omitempty" overridable:"true"`
-	TLSTricks         TLSTricks   `json:"tls-tricks,omitempty"`
-	EnableNTP         bool        `json:"enable-ntp,omitempty"`
+	IgnoreServerRules bool `json:"ignore-server-rules,omitempty"`
+	// Шлюпка: папка со списками «через VPN» / «мимо VPN» (split_tunnel.go). Пусто — выключено.
+	SplitTunnelDir string      `json:"split-tunnel-dir,omitempty"`
+	Warp           WarpOptions `json:"warp,omitempty"`
+	Warp2          WarpOptions `json:"warp2,omitempty"`
+	Mux            MuxOptions  `json:"mux,omitempty" overridable:"true"`
+	TLSTricks      TLSTricks   `json:"tls-tricks,omitempty"`
+	EnableNTP      bool        `json:"enable-ntp,omitempty"`
 
 	DNSOptions
 	InboundOptions
