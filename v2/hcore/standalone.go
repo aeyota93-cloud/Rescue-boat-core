@@ -26,6 +26,11 @@ func RunStandalone(ctx context.Context, hiddifySettingPath string, configPath st
 		fmt.Printf("Error in read and build config %v", err)
 		return err
 	}
+	// Шлюпка: папка статистики в standalone-режиме — из его файла настроек.
+	if static.HiddifyOptions == nil {
+		static.HiddifyOptions = config.DefaultHiddifyOptions()
+	}
+	static.HiddifyOptions.RescueStatsDir = current.HiddifyHiddifyOptions.RescueStatsDir
 
 	_, err = StartService(ctx, &StartRequest{
 		ConfigContent:          current.Config,

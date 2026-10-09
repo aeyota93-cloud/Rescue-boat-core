@@ -3,6 +3,7 @@ package hcore
 import (
 	"context"
 
+	"github.com/hiddify/hiddify-core/v2/rescuestats"
 	box "github.com/sagernet/sing-box"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -15,6 +16,15 @@ import (
 )
 
 func NewService(ctx context.Context, options option.Options) (*daemon.StartedService, error) {
+	return newService(ctx, options, nil)
+}
+
+// newService — то же, но со сборщиком статистики (nil — без него).
+func newService(ctx context.Context, options option.Options, stats *rescuestats.Collector) (*daemon.StartedService, error) {
+	extraServices := []adapter.LifecycleService{&hiddifyMainServiceManager{}}
+	if stats != nil {
+		extraServices = append(extraServices, stats)
+	}
 
 	// ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
 	logInterface := LogInterface{}
@@ -23,16 +33,17 @@ func NewService(ctx context.Context, options option.Options) (*daemon.StartedSer
 		Debug:       static.debug,
 		LogMaxLines: 100,
 		// Options:           *options,
-		Handler: &logInterface,
-		ExtraServices: []adapter.LifecycleService{
-			&hiddifyMainServiceManager{},
-		},
+		Handler:       &logInterface,
+		ExtraServices: extraServices,
 	}
 	err := libbox.CheckConfigOptions(&options)
 	if err != nil {
 		return nil, err
 	}
 	instance := daemon.NewStartedService(bopts)
+	if stats != nil {
+		stats.Bind(instance)
+	}
 
 	// for i := 0; i < 10; i++ {
 	// 	if hutils.IsPortInUse(options.Inbounds[0].SocksOptions.ListenPort) {

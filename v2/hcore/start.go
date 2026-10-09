@@ -9,6 +9,7 @@ import (
 	"github.com/hiddify/hiddify-core/v2/config"
 	"github.com/hiddify/hiddify-core/v2/db"
 	hcommon "github.com/hiddify/hiddify-core/v2/hcommon"
+	"github.com/hiddify/hiddify-core/v2/rescuestats"
 	service_manager "github.com/hiddify/hiddify-core/v2/service_manager"
 	"github.com/sagernet/sing-box/adapter"
 	C "github.com/sagernet/sing-box/constant"
@@ -131,8 +132,12 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 		<-time.After(1000 * time.Millisecond)
 	}
 	libbox.SetMemoryLimit(C.IsIos || !in.DisableMemoryLimit)
-	instance, err := NewService(ctx, *options)
+	stats := newRescueStats()
+	instance, err := newService(ctx, *options, stats)
 	if err != nil {
+		if stats != nil {
+			stats.Close()
+		}
 		return errorWrapper(MessageType_START_SERVICE, err)
 	}
 	static.StartedService = instance
@@ -146,4 +151,19 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 	}
 
 	return SetCoreStatus(CoreStates_STARTED, MessageType_EMPTY, ""), nil
+}
+
+// newRescueStats — сборщик статистики «Шлюпки», если приложение задало папку (иначе nil).
+func newRescueStats() *rescuestats.Collector {
+	hopt := static.HiddifyOptions
+	if hopt == nil || hopt.RescueStatsDir == "" {
+		return nil
+	}
+	return rescuestats.New(rescuestats.Options{
+		Dir:            hopt.RescueStatsDir,
+		TestURL:        hopt.ConnectionTestUrl,
+		VPNOutbound:    config.OutboundMainDetour,
+		DirectOutbound: config.OutboundDirectTag,
+		NoProbe:        hopt.RescueStatsProbe != nil && !*hopt.RescueStatsProbe,
+	})
 }
