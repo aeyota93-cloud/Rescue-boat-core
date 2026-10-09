@@ -27,7 +27,10 @@ type HiddifyOptions struct {
 	// Шлюпка: не брать правила маршрутов из подписки (по умолчанию берутся).
 	IgnoreServerRules bool `json:"ignore-server-rules,omitempty"`
 	// Шлюпка: папка со списками «через VPN» / «мимо VPN» (split_tunnel.go). Пусто — выключено.
-	SplitTunnelDir string      `json:"split-tunnel-dir,omitempty"`
+	SplitTunnelDir string `json:"split-tunnel-dir,omitempty"`
+	// Шлюпка: папка статистики — ошибки соединений и замеры качества (v2/rescuestats).
+	// Пусто — ядро ничего не пишет и не замеряет.
+	RescueStatsDir string      `json:"rescue-stats-dir,omitempty"`
 	Warp           WarpOptions `json:"warp,omitempty"`
 	Warp2          WarpOptions `json:"warp2,omitempty"`
 	Mux            MuxOptions  `json:"mux,omitempty" overridable:"true"`
