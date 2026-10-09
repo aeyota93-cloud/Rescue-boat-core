@@ -30,12 +30,15 @@ type HiddifyOptions struct {
 	SplitTunnelDir string `json:"split-tunnel-dir,omitempty"`
 	// Шлюпка: папка статистики — ошибки соединений и замеры качества (v2/rescuestats).
 	// Пусто — ядро ничего не пишет и не замеряет.
-	RescueStatsDir string      `json:"rescue-stats-dir,omitempty"`
-	Warp           WarpOptions `json:"warp,omitempty"`
-	Warp2          WarpOptions `json:"warp2,omitempty"`
-	Mux            MuxOptions  `json:"mux,omitempty" overridable:"true"`
-	TLSTricks      TLSTricks   `json:"tls-tricks,omitempty"`
-	EnableNTP      bool        `json:"enable-ntp,omitempty"`
+	RescueStatsDir string `json:"rescue-stats-dir,omitempty"`
+	// Шлюпка: замеры probe (пинг vpn/direct раз в 60 с). nil или true — идут, false — нет;
+	// ошибки и counters пишутся независимо от флага.
+	RescueStatsProbe *bool       `json:"rescue-stats-probe"`
+	Warp             WarpOptions `json:"warp,omitempty"`
+	Warp2            WarpOptions `json:"warp2,omitempty"`
+	Mux              MuxOptions  `json:"mux,omitempty" overridable:"true"`
+	TLSTricks        TLSTricks   `json:"tls-tricks,omitempty"`
+	EnableNTP        bool        `json:"enable-ntp,omitempty"`
 
 	DNSOptions
 	InboundOptions
