@@ -14,6 +14,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
@@ -28,6 +29,23 @@ const (
 // Пустой набор правил: файл должен существовать, иначе sing-box не запустится.
 const emptyRuleSet = `{"version": 3, "rules": []}` + "\n"
 
+// sing-box (filemanager.BasePath) считает абсолютным только путь, начинающийся с «/», а всё
+// остальное приклеивает к рабочей папке ядра — в том числе «C:\...» на Windows, и файл не
+// находится. Ядро при Setup делает Chdir в рабочую папку, поэтому отдаём путь относительно неё.
+func ruleSetPath(p string) string {
+	if strings.HasPrefix(p, "/") || !filepath.IsAbs(p) {
+		return p
+	}
+	wd, err := os.Getwd()
+	if err != nil {
+		return p
+	}
+	if rel, err := filepath.Rel(wd, p); err == nil {
+		return rel
+	}
+	return p
+}
+
 func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 	var res rescueRules
 	if hopt.SplitTunnelDir == "" {
@@ -39,7 +57,7 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 			_ = os.MkdirAll(hopt.SplitTunnelDir, 0o755)
 			_ = os.WriteFile(p, []byte(emptyRuleSet), 0o644)
 		}
-		return p
+		return ruleSetPath(p)
 	}
 	local := func(tag, name string) option.RuleSet {
 		return option.RuleSet{

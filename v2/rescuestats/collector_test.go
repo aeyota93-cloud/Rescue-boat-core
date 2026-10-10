@@ -199,11 +199,16 @@ func TestConnErrorFilters(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("want 2 lines, got %v", lines)
 	}
-	if lines[0]["kind"] != KindEOF || lines[0]["route"] != RouteDirect || lines[0]["dur_ms"] != float64(0) {
-		t.Errorf("eof before data: %v", lines[0])
+	// Порядок строк с одинаковым временем не гарантирован — ищем по сайту.
+	byHost := map[any]map[string]any{}
+	for _, l := range lines {
+		byHost[l["host"]] = l
 	}
-	if lines[1]["route"] != RouteBlock {
-		t.Errorf("block route: %v", lines[1])
+	if l := byHost["eof.example"]; l["kind"] != KindEOF || l["route"] != RouteDirect || l["dur_ms"] != float64(0) {
+		t.Errorf("eof before data: %v", l)
+	}
+	if l := byHost["blocked.example"]; l["route"] != RouteBlock {
+		t.Errorf("block route: %v", l)
 	}
 }
 

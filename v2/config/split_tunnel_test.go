@@ -73,3 +73,32 @@ func TestSplitTunnelFileFormat(t *testing.T) {
 		t.Errorf("пустой набор: %v", err)
 	}
 }
+
+// sing-box приклеивает к рабочей папке любой путь без «/» в начале, в том числе «C:\...».
+// Путь из набора правил должен находиться так, как его откроет sing-box: Join(рабочая папка, путь).
+func TestSplitTunnelRuleSetPathFromWorkingDir(t *testing.T) {
+	work := t.TempDir()
+	t.Chdir(work)
+	dir := filepath.Join(work, "split")
+	hopt := DefaultHiddifyOptions()
+	hopt.SplitTunnelDir = dir
+	o := buildTestConfig(t, testSubscription, hopt)
+
+	found := 0
+	for _, rs := range o.Route.RuleSet {
+		p := rs.LocalOptions.Path
+		if p == "" {
+			continue
+		}
+		found++
+		if filepath.IsAbs(p) {
+			t.Errorf("путь набора правил %q абсолютный — sing-box склеит его с рабочей папкой", p)
+		}
+		if _, err := os.Stat(filepath.Join(work, p)); err != nil {
+			t.Errorf("sing-box не найдёт %q: %v", p, err)
+		}
+	}
+	if found != 3 {
+		t.Fatalf("ожидалось 3 локальных набора правил, найдено %d", found)
+	}
+}
