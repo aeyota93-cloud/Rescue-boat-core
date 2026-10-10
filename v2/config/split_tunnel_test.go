@@ -17,7 +17,7 @@ func TestSplitTunnelRules(t *testing.T) {
 	hopt.SplitTunnelDir = dir
 	o := buildTestConfig(t, testSubscription, hopt)
 
-	for _, name := range []string{"via-vpn.json", "bypass-vpn.json", "bypass-domains.json"} {
+	for _, name := range []string{"via-vpn.json", "via-domains.json", "bypass-vpn.json", "bypass-domains.json"} {
 		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
 			t.Errorf("ядро должно создать пустой %s: %v", name, err)
 		}
@@ -98,7 +98,7 @@ func TestSplitTunnelRuleSetPathFromWorkingDir(t *testing.T) {
 			t.Errorf("sing-box не найдёт %q: %v", p, err)
 		}
 	}
-	if found != 3 {
-		t.Fatalf("ожидалось 3 локальных набора правил, найдено %d", found)
+	if found != 4 {
+		t.Fatalf("ожидалось 4 локальных набора правил, найдено %d", found)
 	}
 }

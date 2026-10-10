@@ -18,6 +18,7 @@ import (
 	sdns "github.com/sagernet/sing-box/dns"
 	"github.com/sagernet/sing-box/option"
 	"github.com/sagernet/sing/common/json/badoption"
+	N "github.com/sagernet/sing/common/network"
 	"github.com/sagernet/wireguard-go/hiddify"
 )
 
@@ -633,6 +634,20 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions, input *opt
 			RuleAction: option.RuleAction{
 				Action: C.RuleActionTypeHijackDNS,
 			},
+		},
+	})
+
+	// Шлюпка: пинги (ICMP echo) всегда идут напрямую. VLESS и другие выходы VPN не умеют
+	// передавать ICMP, и TUN отвечал на пинг сам, за 0 мс, для любого зарубежного адреса.
+	// Прямой выход честно отправляет пинг через провайдера, поэтому правило стоит выше
+	// всех остальных, включая раздельный туннель и «всё через VPN».
+	routeRules = append(routeRules, option.Rule{
+		Type: C.RuleTypeDefault,
+		DefaultOptions: option.DefaultRule{
+			RawDefaultRule: option.RawDefaultRule{
+				Network: []string{N.NetworkICMP},
+			},
+			RuleAction: routeAction(OutboundDirectTag),
 		},
 	})
 
