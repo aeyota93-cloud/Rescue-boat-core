@@ -81,6 +81,20 @@ func directDNSRule(hopt *HiddifyOptions, raw option.RawDefaultDNSRule) option.De
 	}
 }
 
+func remoteDNSRule(hopt *HiddifyOptions, raw option.RawDefaultDNSRule) option.DefaultDNSRule {
+	return option.DefaultDNSRule{
+		RawDefaultDNSRule: raw,
+		DNSRuleAction: option.DNSRuleAction{
+			Action: C.RuleActionTypeRoute,
+			RouteOptions: option.DNSRouteActionOptions{
+				Server:     DNSMultiRemoteTag,
+				Strategy:   hopt.RemoteDnsDomainStrategy,
+				RewriteTTL: &DEFAULT_DNS_TTL,
+			},
+		},
+	}
+}
+
 func routeAction(outbound string) option.RuleAction {
 	return option.RuleAction{
 		Action:       C.RuleActionTypeRoute,

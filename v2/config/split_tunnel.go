@@ -6,7 +6,9 @@ package config
 // Приложение пишет в SplitTunnelDir файлы наборов правил sing-box (формат source):
 //   via-vpn.json         программы, сайты, IP — всегда через VPN;
 //   bypass-vpn.json      то же — всегда мимо VPN;
-//   bypass-domains.json  только сайты из bypass-vpn.json: их DNS тоже идёт мимо VPN.
+//   bypass-domains.json  только сайты из bypass-vpn.json: их DNS тоже идёт мимо VPN;
+//   via-domains.json     только сайты из via-vpn.json: их DNS идёт через VPN и не режется
+//                        блокировкой рекламы (файл необязательный, без него — пустой).
 // Это локальные наборы правил: sing-box следит за файлами и перечитывает их при изменении,
 // а поиск программ включает сам, как только в наборе появляется правило по программе.
 // Оба списка стоят выше всех остальных правил (сервера, региона, пользовательских).
@@ -22,6 +24,7 @@ import (
 
 const (
 	splitViaTag           = "rescue-via-vpn"
+	splitViaDomainsTag    = "rescue-via-domains"
 	splitBypassTag        = "rescue-bypass-vpn"
 	splitBypassDomainsTag = "rescue-bypass-domains"
 )
@@ -69,6 +72,7 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 	}
 	res.ruleSets = []option.RuleSet{
 		local(splitViaTag, "via-vpn.json"),
+		local(splitViaDomainsTag, "via-domains.json"),
 		local(splitBypassTag, "bypass-vpn.json"),
 		local(splitBypassDomainsTag, "bypass-domains.json"),
 	}
@@ -91,7 +95,11 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 	// Вкладка «Сейчас в сети» показывает, какая программа куда идёт: имя процесса нужно для
 	// каждого соединения, а не только когда в списках есть программы.
 	res.findProcess = isWindows
+	// DNS-правила списков стоят выше блокировки рекламы: сайт, который пользователь сам
+	// добавил в список, не должен получить отказ от geosite-ads. «Через VPN» первым, как и
+	// в маршрутах: если сайт в обоих списках, побеждает «через VPN».
 	res.dns = []option.DefaultDNSRule{
+		remoteDNSRule(hopt, option.RawDefaultDNSRule{RuleSet: []string{splitViaDomainsTag}}),
 		directDNSRule(hopt, option.RawDefaultDNSRule{RuleSet: []string{splitBypassDomainsTag}}),
 	}
 	return res
