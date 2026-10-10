@@ -67,7 +67,8 @@ webui:
 .PHONY: build
 windows-amd64: prepare
 	rm -rf $(BINDIR)/*
-	go run -v "github.com/sagernet/cronet-go/cmd/build-naive@$(CRONET_GO_VERSION)" extract-lib --target windows/amd64 -o $(BINDIR)/
+	# Шлюпка: загрузка libcronet иногда тихо не удаётся — до трёх попыток, пока файл не появится.
+	for i in 1 2 3; do go run -v "github.com/sagernet/cronet-go/cmd/build-naive@$(CRONET_GO_VERSION)" extract-lib --target windows/amd64 -o $(BINDIR)/ && [ -s $(BINDIR)/libcronet.dll ] && break; echo "libcronet: попытка $$i не удалась"; sleep 15; done
 	env GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc  $(GOBUILDLIB) -tags $(TAGS),$(WINDOWS_ADD_TAGS)   -o $(BINDIR)/$(LIBNAME).dll ./platform/desktop
 	echo "core built, now building cli" 
 	ls -R $(BINDIR)/
