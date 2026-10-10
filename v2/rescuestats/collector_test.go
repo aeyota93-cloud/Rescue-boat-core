@@ -358,12 +358,14 @@ func TestStallThroughMaintain(t *testing.T) {
 		r.maintain()
 		e.clock.Add(StallPoll)
 	}
-	step(100, 100)
-	step(200, 200)
-	for i := 0; i < 8; i++ { // 2 с без ответа, программа шлёт
-		step(int64(300+i*100), 200)
+	// плотный поток: данные приходят в каждый опрос (иначе это не «замирание»)
+	for i := 1; i <= 8; i++ {
+		step(int64(i*100), int64(i*100))
 	}
-	step(1200, 300)
+	for i := 0; i < 8; i++ { // 2 с без ответа, программа шлёт
+		step(int64(900+i*100), 800)
+	}
+	step(1700, 900)
 	e.clock.Add(2 * time.Second)
 	lines := e.errorLines(t)
 	if len(lines) != 1 {
