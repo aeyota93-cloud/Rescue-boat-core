@@ -135,27 +135,37 @@ func (r *run) ownContext() context.Context {
 }
 
 func (r *run) vpnOutbound() adapter.Outbound {
-	if r.outbounds == nil {
-		return nil
-	}
-	if r.opts.VPNOutbound != "" {
-		if ob, ok := r.outbounds.Outbound(r.opts.VPNOutbound); ok {
-			return ob
-		}
-	}
-	return r.outbounds.Default()
+	return pickVPNOutbound(r.outbounds, r.opts.VPNOutbound)
 }
 
 func (r *run) directOutbound() adapter.Outbound {
-	if r.outbounds == nil {
+	return pickDirectOutbound(r.outbounds, r.opts.DirectOutbound)
+}
+
+// pickVPNOutbound — выход VPN: заданный по тегу, иначе выход по умолчанию.
+func pickVPNOutbound(outbounds adapter.OutboundManager, tag string) adapter.Outbound {
+	if outbounds == nil {
 		return nil
 	}
-	if r.opts.DirectOutbound != "" {
-		if ob, ok := r.outbounds.Outbound(r.opts.DirectOutbound); ok {
+	if tag != "" {
+		if ob, ok := outbounds.Outbound(tag); ok {
 			return ob
 		}
 	}
-	for _, ob := range r.outbounds.Outbounds() {
+	return outbounds.Default()
+}
+
+// pickDirectOutbound — прямой выход: заданный по тегу, иначе первый типа direct.
+func pickDirectOutbound(outbounds adapter.OutboundManager, tag string) adapter.Outbound {
+	if outbounds == nil {
+		return nil
+	}
+	if tag != "" {
+		if ob, ok := outbounds.Outbound(tag); ok {
+			return ob
+		}
+	}
+	for _, ob := range outbounds.Outbounds() {
 		if ob.Type() == C.TypeDirect {
 			return ob
 		}
