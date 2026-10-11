@@ -206,9 +206,10 @@ type firstResult struct {
 
 // chooseAndFirst делает первое соединение по обеим дорогам (direct, vpn) и выбирает метод:
 //
-//   - TCP на цель открылся напрямую и TLS прошёл — tls;
-//   - TCP открылся, а TLS нет — tcp (меряем только открытие соединения напрямую);
-//   - напрямую TCP не открылся, но через VPN TLS прошёл — tls (прямой путь просто не работает);
+//   - TLS прошёл напрямую — tls;
+//   - напрямую TLS не прошёл (TCP закрыт или рукопожатие сорвано, как при блокировке по SNI),
+//     а через VPN прошёл — tls: прямая дорога просто вся в null;
+//   - TLS не вышел нигде, но напрямую TCP открылся — tcp (меряем только открытие соединения);
 //   - TCP не вышел ни там, ни там — icmp.
 //
 // Через VPN судим только по рукопожатию: открытие TCP у прокси-выхода к цели отношения не имеет.
@@ -226,7 +227,7 @@ func (m *compareMeasure) chooseAndFirst(ctx context.Context) string {
 		m.publish()
 	}
 	switch {
-	case d.tcpOpened && d.tlsOK:
+	case d.tlsOK, v.tlsOK:
 		m.res.Method = MethodTLS
 	case d.tcpOpened:
 		m.res.Method = MethodTLS
@@ -238,8 +239,6 @@ func (m *compareMeasure) chooseAndFirst(ctx context.Context) string {
 		m.vpn.out.Note = noteTCPOnlyVPN
 		m.publish()
 		return "tcp"
-	case v.tlsOK:
-		m.res.Method = MethodTLS
 	default:
 		m.res.Method = MethodICMP
 		m.direct.out.FirstMS = nil

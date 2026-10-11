@@ -123,6 +123,27 @@ func (d *fakeDialer) destinations() []M.Socksaddr {
 
 var _ N.Dialer = (*fakeDialer)(nil)
 
+// cmpTempDir — как t.TempDir, но удаление повторяется: на Windows антивирус ненадолго держит
+// только что переписанные res-файлы, и t.TempDir падает с «directory is not empty».
+func cmpTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "rescue-compare-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		var err error
+		for i := 0; i < 40; i++ {
+			if err = os.RemoveAll(dir); err == nil {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Logf("временная папка не удалена: %v", err)
+	})
+	return dir
+}
+
 type cmpEnv struct {
 	dir    string
 	run    *compareRun
@@ -134,7 +155,7 @@ type cmpEnv struct {
 
 func newCmpEnv(t *testing.T) *cmpEnv {
 	t.Helper()
-	e := &cmpEnv{dir: t.TempDir(), direct: &fakeDialer{}, vpn: &fakeDialer{}}
+	e := &cmpEnv{dir: cmpTempDir(t), direct: &fakeDialer{}, vpn: &fakeDialer{}}
 	e.run = newCompareRunBase(CompareOptions{Dir: e.dir, TestURL: "http://test.invalid/", Now: func() time.Time { return time.UnixMilli(1791640000000) }})
 	e.run.vpnDialer = func() N.Dialer { return e.vpn }
 	e.run.directDialer = func() N.Dialer { return e.direct }
@@ -490,6 +511,23 @@ func TestCompareTCPOnlyWhenTLSFails(t *testing.T) {
 	// Порт открыт, но TLS не отвечает: меряем открытие TCP напрямую, VPN сравнить нельзя.
 	e := newCmpEnv(t)
 	e.run.timeout = 150 * time.Millisecond
+	e.direct.addr = newClosingListener(t)
+	e.vpn.addr = e.direct.addr
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 4})
+	if res.Error != "" || !res.Done || res.Method != MethodTLS {
+		t.Fatalf("итог: %+v", res)
+	}
+	if !res.Paths.Direct.Available || len(res.Paths.Direct.Samples) != 4 || nils(res.Paths.Direct.Samples) != 0 || res.Paths.Direct.FirstMS == nil {
+		t.Errorf("direct: %+v", res.Paths.Direct)
+	}
+	if res.Paths.VPN.Available || res.Paths.VPN.Note == "" || len(res.Paths.VPN.Samples) != 0 {
+		t.Errorf("vpn: %+v", res.Paths.VPN)
+	}
+}
+
+// newClosingListener — TCP-порт открыт, но соединение сразу закрывается (TLS не выйдет).
+func newClosingListener(t *testing.T) string {
+	t.Helper()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -504,17 +542,27 @@ func TestCompareTCPOnlyWhenTLSFails(t *testing.T) {
 			c.Close()
 		}
 	}()
-	e.direct.addr = ln.Addr().String()
-	e.vpn.addr = ln.Addr().String()
-	res := e.measure(t, CompareRequest{Target: "example.test", Count: 4})
-	if res.Error != "" || !res.Done || res.Method != MethodTLS {
+	return ln.Addr().String()
+}
+
+func TestCompareDirectTLSResetStillCompares(t *testing.T) {
+	// Блокировка по SNI: напрямую TCP открывается, но рукопожатие сорвано; через VPN всё
+	// работает. Это сравнение tls (прямая дорога вся в null), а не «только TCP».
+	e := newCmpEnv(t)
+	e.run.timeout = 150 * time.Millisecond
+	e.direct.addr = newClosingListener(t)
+	vs := newCmpServer(t, "vpn", &cmpLog{}, true)
+	e.vpn.addr = hostPort(vs)
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 3})
+	if res.Method != MethodTLS || res.Error != "" {
 		t.Fatalf("итог: %+v", res)
 	}
-	if !res.Paths.Direct.Available || len(res.Paths.Direct.Samples) != 4 || nils(res.Paths.Direct.Samples) != 0 || res.Paths.Direct.FirstMS == nil {
-		t.Errorf("direct: %+v", res.Paths.Direct)
+	d, v := res.Paths.Direct, res.Paths.VPN
+	if !d.Available || d.FirstMS != nil || len(d.Samples) != 3 || nils(d.Samples) != 3 || d.Note != "" {
+		t.Errorf("direct: %+v %s", d, fmtSamples(d.Samples))
 	}
-	if res.Paths.VPN.Available || res.Paths.VPN.Note == "" || len(res.Paths.VPN.Samples) != 0 {
-		t.Errorf("vpn: %+v", res.Paths.VPN)
+	if !v.Available || v.FirstMS == nil || nils(v.Samples) != 0 || len(v.Samples) != 3 {
+		t.Errorf("vpn: %+v %s", v, fmtSamples(v.Samples))
 	}
 }
 
@@ -721,7 +769,7 @@ func TestCompareStopMidMeasure(t *testing.T) {
 // --- очистка ---
 
 func TestCompareCleanup(t *testing.T) {
-	dir := t.TempDir()
+	dir := cmpTempDir(t)
 	now := time.Now()
 	write := func(name, body string, age time.Duration) {
 		p := filepath.Join(dir, name)
