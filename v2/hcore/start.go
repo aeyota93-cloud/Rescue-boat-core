@@ -134,13 +134,17 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 	libbox.SetMemoryLimit(C.IsIos || !in.DisableMemoryLimit)
 	stats := newRescueStats()
 	compare := newRescueCompare()
-	instance, err := newService(ctx, *options, stats, compare)
+	failover := newRescueFailover()
+	instance, err := newService(ctx, *options, stats, compare, failover)
 	if err != nil {
 		if stats != nil {
 			stats.Close()
 		}
 		if compare != nil {
 			compare.Close()
+		}
+		if failover != nil {
+			failover.Close()
 		}
 		return errorWrapper(MessageType_START_SERVICE, err)
 	}
@@ -185,5 +189,23 @@ func newRescueCompare() *rescuestats.Comparer {
 		VPNOutbound:    config.OutboundMainDetour,
 		DirectOutbound: config.OutboundDirectTag,
 		DirectDNS:      config.DNSDirectTag,
+	})
+}
+
+// newRescueFailover — сторож автопереключения «основной → запасной» (docs/rescue-failover.md),
+// если приложение включило rescue-failover (иначе nil). Серверов меньше двух — сторож сам не
+// запустится. Событие переключения пишется в rescue-stats-dir, если она задана.
+func newRescueFailover() *rescuestats.Failover {
+	hopt := static.HiddifyOptions
+	if hopt == nil || !hopt.RescueFailover {
+		return nil
+	}
+	return rescuestats.NewFailover(rescuestats.FailoverOptions{
+		StatsDir:  hopt.RescueStatsDir,
+		TestURL:   hopt.ConnectionTestUrl,
+		SelectTag: config.OutboundSelectTag,
+		Log: func(msg string) {
+			Log(LogLevel_INFO, LogType_CORE, msg)
+		},
 	})
 }

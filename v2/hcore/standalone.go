@@ -33,6 +33,7 @@ func RunStandalone(ctx context.Context, hiddifySettingPath string, configPath st
 	static.HiddifyOptions.RescueStatsDir = current.HiddifyHiddifyOptions.RescueStatsDir
 	static.HiddifyOptions.RescueStatsProbe = current.HiddifyHiddifyOptions.RescueStatsProbe
 	static.HiddifyOptions.RescueCompareDir = current.HiddifyHiddifyOptions.RescueCompareDir
+	static.HiddifyOptions.RescueFailover = current.HiddifyHiddifyOptions.RescueFailover
 
 	_, err = StartService(ctx, &StartRequest{
 		ConfigContent:          current.Config,

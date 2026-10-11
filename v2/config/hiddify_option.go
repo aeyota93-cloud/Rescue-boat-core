@@ -34,6 +34,9 @@ type HiddifyOptions struct {
 	// Шлюпка: папка «Сравнить пути» — запросы req-<id>.json и ответы res-<id>.json
 	// (v2/rescuestats/compare.go, docs/rescue-compare-paths.md). Пусто — выключено.
 	RescueCompareDir string `json:"rescue-compare-dir,omitempty"`
+	// Шлюпка: автопереключение «основной → запасной» (docs/rescue-failover.md,
+	// v2/rescuestats/failover.go). Сторож работает, только если в выходе select ≥ 2 серверов.
+	RescueFailover bool `json:"rescue-failover,omitempty"`
 	// Шлюпка: замеры probe (пинг vpn/direct раз в 60 с). nil или true — идут, false — нет;
 	// ошибки и counters пишутся независимо от флага.
 	RescueStatsProbe *bool       `json:"rescue-stats-probe"`
