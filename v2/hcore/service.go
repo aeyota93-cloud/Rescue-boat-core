@@ -16,14 +16,17 @@ import (
 )
 
 func NewService(ctx context.Context, options option.Options) (*daemon.StartedService, error) {
-	return newService(ctx, options, nil)
+	return newService(ctx, options, nil, nil)
 }
 
-// newService — то же, но со сборщиком статистики (nil — без него).
-func newService(ctx context.Context, options option.Options, stats *rescuestats.Collector) (*daemon.StartedService, error) {
+// newService — то же, но со сборщиком статистики и службой «Сравнить пути» (nil — без них).
+func newService(ctx context.Context, options option.Options, stats *rescuestats.Collector, compare *rescuestats.Comparer) (*daemon.StartedService, error) {
 	extraServices := []adapter.LifecycleService{&hiddifyMainServiceManager{}}
 	if stats != nil {
 		extraServices = append(extraServices, stats)
+	}
+	if compare != nil {
+		extraServices = append(extraServices, compare)
 	}
 
 	// ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
@@ -43,6 +46,9 @@ func newService(ctx context.Context, options option.Options, stats *rescuestats.
 	instance := daemon.NewStartedService(bopts)
 	if stats != nil {
 		stats.Bind(instance)
+	}
+	if compare != nil {
+		compare.Bind(instance)
 	}
 
 	// for i := 0; i < 10; i++ {

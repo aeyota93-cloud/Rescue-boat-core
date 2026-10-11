@@ -133,10 +133,14 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 	}
 	libbox.SetMemoryLimit(C.IsIos || !in.DisableMemoryLimit)
 	stats := newRescueStats()
-	instance, err := newService(ctx, *options, stats)
+	compare := newRescueCompare()
+	instance, err := newService(ctx, *options, stats, compare)
 	if err != nil {
 		if stats != nil {
 			stats.Close()
+		}
+		if compare != nil {
+			compare.Close()
 		}
 		return errorWrapper(MessageType_START_SERVICE, err)
 	}
@@ -165,5 +169,21 @@ func newRescueStats() *rescuestats.Collector {
 		VPNOutbound:    config.OutboundMainDetour,
 		DirectOutbound: config.OutboundDirectTag,
 		NoProbe:        hopt.RescueStatsProbe != nil && !*hopt.RescueStatsProbe,
+	})
+}
+
+// newRescueCompare — служба «Сравнить пути», если приложение задало папку (иначе nil).
+// Не зависит от rescue-stats-dir.
+func newRescueCompare() *rescuestats.Comparer {
+	hopt := static.HiddifyOptions
+	if hopt == nil || hopt.RescueCompareDir == "" {
+		return nil
+	}
+	return rescuestats.NewComparer(rescuestats.CompareOptions{
+		Dir:            hopt.RescueCompareDir,
+		TestURL:        hopt.ConnectionTestUrl,
+		VPNOutbound:    config.OutboundMainDetour,
+		DirectOutbound: config.OutboundDirectTag,
+		DirectDNS:      config.DNSDirectTag,
 	})
 }
