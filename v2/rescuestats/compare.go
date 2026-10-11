@@ -384,6 +384,9 @@ func newCompareRun(opts CompareOptions, outbounds adapter.OutboundManager) *comp
 		}
 		return nil
 	}
+	r.ping = newOutboundPing(func() adapter.Outbound {
+		return pickDirectOutbound(outbounds, opts.DirectOutbound)
+	}, systemPing)
 	return r
 }
 
