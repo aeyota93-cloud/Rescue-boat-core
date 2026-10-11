@@ -2,6 +2,7 @@ package rescuestats
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -522,6 +523,52 @@ func TestCompareTCPOnlyWhenTLSFails(t *testing.T) {
 	}
 	if res.Paths.VPN.Available || res.Paths.VPN.Note == "" || len(res.Paths.VPN.Samples) != 0 {
 		t.Errorf("vpn: %+v", res.Paths.VPN)
+	}
+}
+
+// newRawTLSServer — TLS-сервер не по HTTP: на любой запрос отвечает «PONG» и закрывает соединение.
+func newRawTLSServer(t *testing.T) string {
+	t.Helper()
+	certSrc := httptest.NewUnstartedServer(nil)
+	certSrc.StartTLS()
+	cfg := certSrc.TLS.Clone()
+	certSrc.Close()
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer c.Close()
+				buf := make([]byte, 1024)
+				if _, err := c.Read(buf); err == nil {
+					_, _ = c.Write([]byte("PONG"))
+				}
+			}()
+		}
+	}()
+	return ln.Addr().String()
+}
+
+func TestCompareNonHTTPServerAnswerCounts(t *testing.T) {
+	// Сервер по TLS, но не HTTP (короткий ответ без перевода строки): ответ — это замер.
+	e := newCmpEnv(t)
+	e.direct.addr = newRawTLSServer(t)
+	e.vpn.addr = e.direct.addr
+	res := e.measure(t, CompareRequest{Target: "example.test", Port: 8443, Count: 3})
+	if res.Method != MethodTLS || res.Error != "" {
+		t.Fatalf("итог: %+v", res)
+	}
+	for name, p := range map[string]*ComparePath{"direct": res.Paths.Direct, "vpn": res.Paths.VPN} {
+		if !p.Available || len(p.Samples) != 3 || nils(p.Samples) != 0 {
+			t.Errorf("%s: %+v %s", name, p, fmtSamples(p.Samples))
+		}
 	}
 }
 

@@ -362,13 +362,18 @@ func (m *compareMeasure) headRoundTrip(ctx context.Context, p *pathState) (time.
 	if _, err := io.WriteString(p.conn, request); err != nil {
 		return 0, err
 	}
-	line, err := p.br.ReadString('\n')
-	elapsed := time.Since(start)
-	if err != nil {
+	// Время — до первого байта ответа: так же меряется и сервер, отвечающий не по HTTP.
+	if _, err := p.br.Peek(1); err != nil {
 		return 0, err
 	}
-	if !strings.HasPrefix(line, "HTTP/") {
-		return 0, errors.New("не HTTP-ответ")
+	elapsed := time.Since(start)
+	n := p.br.Buffered()
+	if n > 5 {
+		n = 5
+	}
+	if head, _ := p.br.Peek(n); !strings.HasPrefix("HTTP/", string(head)) {
+		p.close() // ответ есть, но не HTTP: следующий замер — на новом соединении
+		return elapsed, nil
 	}
 	for {
 		l, err := p.br.ReadString('\n')
