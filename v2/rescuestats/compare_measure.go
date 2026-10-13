@@ -11,8 +11,10 @@ import (
 	"io"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/sagernet/sing-box/adapter"
@@ -89,8 +91,9 @@ type pathState struct {
 	dialer N.Dialer
 	out    *ComparePath
 
-	conn net.Conn // живое TLS-соединение для замеров keep-alive
-	br   *bufio.Reader
+	conn   net.Conn // живое TLS-соединение для замеров keep-alive
+	br     *bufio.Reader
+	cancel context.CancelFunc // контекст, с которым открыто conn (см. connect)
 }
 
 type compareMeasure struct {
@@ -292,9 +295,19 @@ func (m *compareMeasure) connectFirst(ctx context.Context, p *pathState) firstRe
 }
 
 // connect: dial → TLS-рукопожатие, всё в пределах таймаута замера. Соединение остаётся в p.
+// Контекст соединения живёт, пока живо само соединение: XHTTP привязывает соединение к
+// контексту набора, и отмена сразу после рукопожатия рвала его — через запасной XHTTP все
+// замеры выходили «не ответил». Таймаут — таймером, который снимается после рукопожатия.
 func (m *compareMeasure) connect(ctx context.Context, p *pathState) (res firstResult) {
-	cctx, cancel := context.WithTimeout(ctx, m.r.timeout)
-	defer cancel()
+	cctx, cancel := context.WithCancel(ctx)
+	timer := time.AfterFunc(m.r.timeout, cancel)
+	ok := false
+	defer func() {
+		if !ok {
+			timer.Stop()
+			cancel()
+		}
+	}()
 	start := time.Now()
 	conn, err := p.dialer.DialContext(cctx, N.NetworkTCP, m.destination(p))
 	if err != nil {
@@ -311,9 +324,14 @@ func (m *compareMeasure) connect(ctx context.Context, p *pathState) (res firstRe
 		_ = conn.Close()
 		return
 	}
-	res.tlsOK = true
 	res.total = time.Since(start)
-	p.conn = tlsConn
+	if !timer.Stop() { // таймаут сработал на последнем шаге — контекст уже отменён
+		_ = conn.Close()
+		return
+	}
+	ok = true
+	res.tlsOK = true
+	p.conn, p.cancel = tlsConn, cancel
 	p.br = bufio.NewReader(tlsConn)
 	return
 }
@@ -383,15 +401,29 @@ func (m *compareMeasure) headRoundTrip(ctx context.Context, p *pathState) (time.
 	_ = p.conn.SetDeadline(deadline)
 	stop := context.AfterFunc(ctx, func() { _ = p.conn.SetDeadline(time.Unix(1, 0)) })
 	defer stop()
+	// У XHTTP SetDeadline ничего не делает: зависший ответ прерываем закрытием соединения.
+	conn := p.conn
+	var timedOut atomic.Bool
+	guard := time.AfterFunc(time.Until(deadline), func() {
+		timedOut.Store(true)
+		_ = conn.Close()
+	})
+	defer guard.Stop()
+	wrap := func(err error) error {
+		if timedOut.Load() {
+			return os.ErrDeadlineExceeded
+		}
+		return err
+	}
 
 	request := "HEAD / HTTP/1.1\r\nHost: " + m.host + "\r\nUser-Agent: prichal-compare\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n"
 	start := time.Now()
 	if _, err := io.WriteString(p.conn, request); err != nil {
-		return 0, err
+		return 0, wrap(err)
 	}
 	// Время — до первого байта ответа: так же меряется и сервер, отвечающий не по HTTP.
 	if _, err := p.br.Peek(1); err != nil {
-		return 0, err
+		return 0, wrap(err)
 	}
 	elapsed := time.Since(start)
 	n := p.br.Buffered()
@@ -523,7 +555,10 @@ func (p *pathState) close() {
 	if p.conn != nil {
 		_ = p.conn.Close()
 	}
-	p.conn, p.br = nil, nil
+	if p.cancel != nil {
+		p.cancel()
+	}
+	p.conn, p.br, p.cancel = nil, nil, nil
 }
 
 func msOf(d time.Duration) int {

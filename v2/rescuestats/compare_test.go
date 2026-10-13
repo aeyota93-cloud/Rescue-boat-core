@@ -93,7 +93,17 @@ type fakeDialer struct {
 	dests    []M.Socksaddr
 	dials    atomic.Int32
 	urlTests atomic.Int32 // оценок качества через этот выход (icmp)
+	// xhttp — соединение ведёт себя как у транспорта XHTTP: умирает вместе с контекстом
+	// набора, SetDeadline ничего не делает.
+	xhttp bool
 }
+
+// xhttpConn — соединение «как у XHTTP»: тайм-ауты не работают.
+type xhttpConn struct{ net.Conn }
+
+func (xhttpConn) SetDeadline(time.Time) error      { return nil }
+func (xhttpConn) SetReadDeadline(time.Time) error  { return nil }
+func (xhttpConn) SetWriteDeadline(time.Time) error { return nil }
 
 func (d *fakeDialer) DialContext(ctx context.Context, network string, dest M.Socksaddr) (net.Conn, error) {
 	d.mu.Lock()
@@ -111,7 +121,12 @@ func (d *fakeDialer) DialContext(ctx context.Context, network string, dest M.Soc
 		}
 	}
 	var nd net.Dialer
-	return nd.DialContext(ctx, "tcp", d.addr)
+	conn, err := nd.DialContext(ctx, "tcp", d.addr)
+	if err != nil || !d.xhttp {
+		return conn, err
+	}
+	context.AfterFunc(ctx, func() { _ = conn.Close() })
+	return xhttpConn{conn}, nil
 }
 
 func (d *fakeDialer) ListenPacket(ctx context.Context, dest M.Socksaddr) (net.PacketConn, error) {
@@ -1091,5 +1106,59 @@ func TestPickServerOutbounds(t *testing.T) {
 	one := &fakeOutbounds{list: []adapter.Outbound{group("select", "NL"), nl}}
 	if pickServerOutbounds(one, "select") != nil {
 		t.Error("один сервер — он и есть vpn, servers не нужен")
+	}
+}
+
+// XHTTP: соединение живёт, пока жив контекст набора. Раньше контекст отменялся сразу после
+// рукопожатия — у запасного XHTTP «первое подключение» было, а все замеры «не ответил».
+func TestCompareXHTTPConnOutlivesDial(t *testing.T) {
+	e := newCmpEnv(t)
+	log := &cmpLog{}
+	ds := newCmpServer(t, "direct", log, true)
+	vs := newCmpServer(t, "vpn", log, true)
+	xs := newCmpServer(t, "xhttp", log, true)
+	e.direct.addr, e.vpn.addr = hostPort(ds), hostPort(vs)
+	sd := e.withServers("NL", "NL запасной")
+	sd[0].addr, sd[1].addr, sd[1].xhttp = hostPort(vs), hostPort(xs), true
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 4})
+	if len(res.Paths.Servers) != 2 {
+		t.Fatalf("итог: %+v", res)
+	}
+	if p := res.Paths.Servers[1]; !p.Available || p.FirstMS == nil || nils(p.Samples) != 0 {
+		t.Errorf("запасной XHTTP: %+v %s", p.ComparePath, fmtSamples(p.Samples))
+	}
+	if n := sd[1].dials.Load(); n != 1 {
+		t.Errorf("XHTTP: соединений %d, нужно одно на все замеры", n)
+	}
+}
+
+// XHTTP: SetDeadline не работает — зависший ответ всё равно даёт null в пределах таймаута,
+// а не вешает весь замер.
+func TestCompareXHTTPHangIsNull(t *testing.T) {
+	e := newCmpEnv(t)
+	e.run.timeout = 150 * time.Millisecond
+	log := &cmpLog{}
+	ds := newCmpServer(t, "direct", log, true)
+	vs := newCmpServer(t, "vpn", log, true)
+	xs := newCmpServer(t, "xhttp", log, true)
+	xs.slow = func(n int) time.Duration {
+		if n == 0 {
+			return 600 * time.Millisecond
+		}
+		return 0
+	}
+	e.direct.addr, e.vpn.addr = hostPort(ds), hostPort(vs)
+	sd := e.withServers("NL", "NL запасной")
+	sd[0].addr, sd[1].addr, sd[1].xhttp = hostPort(vs), hostPort(xs), true
+	start := time.Now()
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 3})
+	if !res.Done || len(res.Paths.Servers) != 2 {
+		t.Fatalf("итог: %+v", res)
+	}
+	if v := res.Paths.Servers[1].Samples; len(v) != 3 || v[0] != nil {
+		t.Errorf("XHTTP samples: %s", fmtSamples(v))
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Errorf("замер шёл %v — зависание не прервано", d)
 	}
 }
