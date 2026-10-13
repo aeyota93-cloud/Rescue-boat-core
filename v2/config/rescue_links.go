@@ -50,17 +50,33 @@ func mergeRescueLinks(ctx context.Context, obj map[string]interface{}, configOpt
 			}
 		}
 	}
+	// Недостающий сервер встаёт сразу за тем, что идёт перед ним в ссылках: порядок ссылок —
+	// порядок хостов в панели (priority), а в JSON его нет — XHTTP оттуда выкинут.
+	prev := ""
 	for _, out := range extra {
 		tag, _ := out["tag"].(string)
 		tag = ray2singTagSuffix.ReplaceAllString(tag, "")
-		if tag == "" || known[tag] {
+		if tag == "" {
 			continue
 		}
-		known[tag] = true
-		out["tag"] = tag
-		outbounds = append(outbounds, out)
+		if !known[tag] {
+			known[tag] = true
+			out["tag"] = tag
+			outbounds = insertAfterTag(outbounds, prev, out)
+		}
+		prev = tag
 	}
 	obj["outbounds"] = outbounds
+}
+
+// insertAfterTag вставляет out сразу за выходом с тегом after; нет такого — в конец.
+func insertAfterTag(outbounds []interface{}, after string, out map[string]interface{}) []interface{} {
+	for i, item := range outbounds {
+		if m, ok := item.(map[string]interface{}); ok && after != "" && m["tag"] == after {
+			return append(outbounds[:i+1], append([]interface{}{out}, outbounds[i+1:]...)...)
+		}
+	}
+	return append(outbounds, out)
 }
 
 func rescueLinkOutbounds(ctx context.Context, links string, configOpt *HiddifyOptions) ([]map[string]interface{}, error) {

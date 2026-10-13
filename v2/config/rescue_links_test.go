@@ -67,3 +67,29 @@ func TestRescueLinksBrokenIgnored(t *testing.T) {
 		t.Fatalf("при битых ссылках остаются серверы JSON: %v", got)
 	}
 }
+
+// Как в подписке с тремя хостами: в JSON нет XHTTP (запасной), но есть Hysteria2 («игры»);
+// запасной должен встать между ними — порядок ссылок = порядок хостов в панели.
+func TestRescueLinksKeepPanelOrder(t *testing.T) {
+	var obj map[string]interface{}
+	if err := json.Unmarshal([]byte(testSubscription), &obj); err != nil {
+		t.Fatal(err)
+	}
+	obj["outbounds"] = append(obj["outbounds"].([]interface{}), map[string]interface{}{
+		"type": "hysteria2", "tag": "NL игры", "server": "203.0.113.10", "server_port": 443,
+		"password": "x", "tls": map[string]interface{}{"enabled": true, "server_name": "vpn.example.com"},
+	})
+	obj[rescueLinksKey] = testRescueLinks +
+		"hysteria2://x@203.0.113.10:443?sni=vpn.example.com#NL%20%D0%B8%D0%B3%D1%80%D1%8B\n"
+	b, _ := json.Marshal(obj)
+	o := buildTestConfig(t, string(b), DefaultHiddifyOptions())
+	var got []string
+	for _, out := range o.Outbounds {
+		if out.Type == C.TypeVLESS || out.Type == C.TypeHysteria2 {
+			got = append(got, out.Tag)
+		}
+	}
+	if !slices.Equal(got, []string{"NL", "NL запасной", "NL игры"}) {
+		t.Fatalf("порядок серверов %v, нужен как в панели: основной, запасной, игры", got)
+	}
+}
