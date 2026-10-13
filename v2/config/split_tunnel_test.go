@@ -10,6 +10,18 @@ import (
 	"github.com/sagernet/sing/common/json"
 )
 
+// Общий пример с приложением (docs/rescue-servers-v2.md): ключ считается одинаково.
+func TestServerKey(t *testing.T) {
+	for tag, want := range map[string]string{
+		"NL запасной": "b286f8a79b8f",
+		"NL":          "4334ffcf7813",
+	} {
+		if got := ServerKey(tag); got != want {
+			t.Errorf("ServerKey(%q) = %q, ждали %q", tag, got, want)
+		}
+	}
+}
+
 func TestSplitTunnelRules(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "split")
 	hopt := DefaultHiddifyOptions()

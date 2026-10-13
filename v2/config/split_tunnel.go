@@ -14,6 +14,8 @@ package config
 // Оба списка стоят выше всех остальных правил (сервера, региона, пользовательских).
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,6 +23,13 @@ import (
 	C "github.com/sagernet/sing-box/constant"
 	"github.com/sagernet/sing-box/option"
 )
+
+// ServerKey — ключ сервера для имён файлов (docs/rescue-servers-v2.md): первые 12 символов
+// hex(sha256(UTF-8 тега)), строчные. Приложение считает так же.
+func ServerKey(tag string) string {
+	sum := sha256.Sum256([]byte(tag))
+	return hex.EncodeToString(sum[:6])
+}
 
 const (
 	splitViaTag           = "rescue-via-vpn"
