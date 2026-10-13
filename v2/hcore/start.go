@@ -187,6 +187,7 @@ func newRescueCompare() *rescuestats.Comparer {
 		Dir:            hopt.RescueCompareDir,
 		TestURL:        hopt.ConnectionTestUrl,
 		VPNOutbound:    config.OutboundMainDetour,
+		SelectTag:      config.OutboundSelectTag,
 		DirectOutbound: config.OutboundDirectTag,
 		DirectDNS:      config.DNSDirectTag,
 	})

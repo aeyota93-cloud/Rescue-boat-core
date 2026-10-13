@@ -85,6 +85,7 @@ func pickAddr(addrs []netip.Addr) (netip.Addr, error) {
 // pathState — одна дорога в замере.
 type pathState struct {
 	name   string
+	proxy  bool // выход VPN (select или отдельный сервер): домен резолвит сам выход
 	dialer N.Dialer
 	out    *ComparePath
 
@@ -93,14 +94,15 @@ type pathState struct {
 }
 
 type compareMeasure struct {
-	r      *compareRun
-	req    *CompareRequest
-	res    *CompareResult
-	direct *pathState
-	vpn    *pathState
-	host   string // для заголовка Host
-	sni    string
-	addr   netip.Addr
+	r       *compareRun
+	req     *CompareRequest
+	res     *CompareResult
+	direct  *pathState
+	vpn     *pathState
+	servers []*pathState // по порядку select
+	host    string       // для заголовка Host
+	sni     string
+	addr    netip.Addr
 }
 
 func newCompareMeasure(r *compareRun, req *CompareRequest) *compareMeasure {
@@ -108,12 +110,17 @@ func newCompareMeasure(r *compareRun, req *CompareRequest) *compareMeasure {
 	res.Target = req.Target
 	m := &compareMeasure{r: r, req: req, res: res}
 	m.direct = &pathState{name: "direct", out: res.Paths.Direct}
-	m.vpn = &pathState{name: "vpn", out: res.Paths.VPN}
+	m.vpn = &pathState{name: "vpn", proxy: true, out: res.Paths.VPN}
 	if d := r.directDialer(); d != nil {
 		m.direct.dialer = d
 	}
 	if d := r.vpnDialer(); d != nil {
 		m.vpn.dialer = d
+	}
+	for _, s := range r.serverDialers() {
+		out := &CompareServerPath{Tag: s.tag, ComparePath: *newComparePath()}
+		res.Paths.Servers = append(res.Paths.Servers, out)
+		m.servers = append(m.servers, &pathState{name: s.tag, proxy: true, dialer: s.dialer, out: &out.ComparePath})
 	}
 	if ip, err := netip.ParseAddr(req.Target); err == nil {
 		m.addr = ip
@@ -131,13 +138,24 @@ func newCompareMeasure(r *compareRun, req *CompareRequest) *compareMeasure {
 	return m
 }
 
+// proxies — дороги через VPN: vpn, потом серверы по порядку.
+func (m *compareMeasure) proxies() []*pathState {
+	return append([]*pathState{m.vpn}, m.servers...)
+}
+
+// all — все дороги в порядке круга: direct, vpn, сервер 1, сервер 2, …
+func (m *compareMeasure) all() []*pathState {
+	return append([]*pathState{m.direct}, m.proxies()...)
+}
+
 func (m *compareMeasure) publish() {
 	_ = writeCompareResult(m.r.dir, m.res)
 }
 
 func (m *compareMeasure) finish(errText string) {
-	m.direct.close()
-	m.vpn.close()
+	for _, p := range m.all() {
+		p.close()
+	}
 	m.res.Done = true
 	m.res.Finished = m.r.now().UnixMilli()
 	if errText != "" {
@@ -168,12 +186,14 @@ func (m *compareMeasure) run() {
 	m.publish()
 
 	m.direct.out.Available = m.direct.dialer != nil
-	m.vpn.out.Available = m.vpn.dialer != nil
 	if m.direct.dialer == nil {
 		m.direct.out.Note = noteNoDirect
 	}
-	if m.vpn.dialer == nil {
-		m.vpn.out.Note = noteNoVPN
+	for _, p := range m.proxies() {
+		p.out.Available = p.dialer != nil
+		if p.dialer == nil {
+			p.out.Note = noteNoVPN
+		}
 	}
 
 	method := m.chooseAndFirst(ctx)
@@ -204,48 +224,55 @@ type firstResult struct {
 	total     time.Duration // до завершённого рукопожатия
 }
 
-// chooseAndFirst делает первое соединение по обеим дорогам (direct, vpn) и выбирает метод:
+// chooseAndFirst делает первое соединение по всем дорогам (direct, vpn, серверы) и выбирает метод:
 //
 //   - TLS прошёл напрямую — tls;
 //   - напрямую TLS не прошёл (TCP закрыт или рукопожатие сорвано, как при блокировке по SNI),
-//     а через VPN прошёл — tls: прямая дорога просто вся в null;
+//     а через VPN или какой-то сервер прошёл — tls: прямая дорога просто вся в null;
 //   - TLS не вышел нигде, но напрямую TCP открылся — tcp (меряем только открытие соединения);
 //   - TCP не вышел ни там, ни там — icmp.
 //
 // Через VPN судим только по рукопожатию: открытие TCP у прокси-выхода к цели отношения не имеет.
 func (m *compareMeasure) chooseAndFirst(ctx context.Context) string {
-	var d, v firstResult
+	var d firstResult
 	if m.direct.dialer != nil {
 		d = m.connectFirst(ctx, m.direct)
 		m.publish()
 	}
-	if ctx.Err() != nil {
-		return MethodTLS
-	}
-	if m.vpn.dialer != nil {
-		v = m.connectFirst(ctx, m.vpn)
-		m.publish()
+	proxyTLS := false
+	for _, p := range m.proxies() {
+		if ctx.Err() != nil {
+			return MethodTLS
+		}
+		if p.dialer != nil {
+			proxyTLS = m.connectFirst(ctx, p).tlsOK || proxyTLS
+			m.publish()
+		}
 	}
 	switch {
-	case d.tlsOK, v.tlsOK:
+	case d.tlsOK, proxyTLS:
 		m.res.Method = MethodTLS
 	case d.tcpOpened:
 		m.res.Method = MethodTLS
 		m.direct.out.Note = noteTCPOnlyDir
 		first := msOf(d.tcpTime)
 		m.direct.out.FirstMS = &first
-		m.vpn.out.Available = false
-		m.vpn.out.FirstMS = nil
-		m.vpn.out.Note = noteTCPOnlyVPN
+		for _, p := range m.proxies() {
+			p.out.Available = false
+			p.out.FirstMS = nil
+			p.out.Note = noteTCPOnlyVPN
+		}
 		m.publish()
 		return "tcp"
 	default:
 		m.res.Method = MethodICMP
 		m.direct.out.FirstMS = nil
-		m.vpn.out.FirstMS = nil
-		m.vpn.out.Available = false
-		m.vpn.out.Estimate = true
-		m.vpn.out.Note = noteICMPVPN
+		for _, p := range m.proxies() {
+			p.out.FirstMS = nil
+			p.out.Available = false
+			p.out.Estimate = true
+			p.out.Note = noteICMPVPN
+		}
 		m.publish()
 		return MethodICMP
 	}
@@ -291,11 +318,11 @@ func (m *compareMeasure) connect(ctx context.Context, p *pathState) (res firstRe
 	return
 }
 
-// destination: напрямую — уже найденный адрес (DNS в замер не входит); через VPN — домен как
-// есть, его резолвит сам выход.
+// destination: напрямую — уже найденный адрес (DNS в замер не входит); через VPN и серверы —
+// домен как есть, его резолвит сам выход.
 func (m *compareMeasure) destination(p *pathState) M.Socksaddr {
 	port := uint16(m.req.Port)
-	if p.name == "vpn" && m.sni != "" {
+	if p.proxy && m.sni != "" {
 		return M.Socksaddr{Fqdn: m.req.Target, Port: port}
 	}
 	return M.Socksaddr{Addr: m.addr, Port: port}
@@ -305,7 +332,7 @@ func (m *compareMeasure) destination(p *pathState) M.Socksaddr {
 
 func (m *compareMeasure) runTLS(ctx context.Context) {
 	for i := 0; i < m.req.Count; i++ {
-		for _, p := range []*pathState{m.direct, m.vpn} {
+		for _, p := range m.all() {
 			if ctx.Err() != nil {
 				return
 			}
@@ -416,7 +443,8 @@ func (m *compareMeasure) runTCPOnly(ctx context.Context) {
 
 // --- icmp ---
 
-// runICMP: direct — ping цели, vpn — оценка качества туннеля (connection-test-url через VPN).
+// runICMP: direct — ping цели, vpn и серверы — оценка качества туннеля (connection-test-url
+// через этот выход).
 func (m *compareMeasure) runICMP(ctx context.Context) {
 	link := m.r.opts.TestURL
 	if link == "" {
@@ -448,8 +476,11 @@ func (m *compareMeasure) runICMP(ctx context.Context) {
 				return
 			}
 		}
-		if m.vpn.dialer != nil {
-			m.vpn.out.Samples = append(m.vpn.out.Samples, m.urlTestSample(ctx, link))
+		for _, p := range m.proxies() {
+			if p.dialer == nil {
+				continue
+			}
+			p.out.Samples = append(p.out.Samples, m.urlTestSample(ctx, link, p))
 			m.publish()
 			if !m.sleep(ctx) {
 				return
@@ -461,10 +492,10 @@ func (m *compareMeasure) runICMP(ctx context.Context) {
 	}
 }
 
-func (m *compareMeasure) urlTestSample(ctx context.Context, link string) *int {
+func (m *compareMeasure) urlTestSample(ctx context.Context, link string, p *pathState) *int {
 	tctx, cancel := context.WithTimeout(ctx, m.r.timeout)
 	defer cancel()
-	d, err := m.r.urlTest(tctx, link, m.vpn.dialer)
+	d, err := m.r.urlTest(tctx, link, p.dialer)
 	if err != nil || d <= 0 || d > m.r.timeout {
 		return nil
 	}
