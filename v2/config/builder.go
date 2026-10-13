@@ -685,7 +685,7 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions, input *opt
 	// },	}
 
 	// Шлюпка: списки «через VPN» и «мимо VPN» важнее всех остальных правил (split_tunnel.go).
-	split := splitTunnelRules(hopt)
+	split := splitTunnelRules(options, hopt)
 	routeRules = append(routeRules, split.route...)
 	dnsRules = append(dnsRules, split.dns...)
 	rulesets = append(rulesets, split.ruleSets...)
