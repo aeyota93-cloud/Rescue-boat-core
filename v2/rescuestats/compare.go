@@ -3,9 +3,11 @@ package rescuestats
 // «Сравнить пути» (docs/rescue-compare-paths.md): приложение кладёт в папку rescue-compare-dir
 // запрос req-<id>.json, ядро меряет цель напрямую и через VPN поочерёдно и пишет (перезаписывает
 // по ходу дела) res-<id>.json. Работает независимо от сборщика статистики (Collector).
+// v2 (docs/rescue-servers-v2.md): при двух и более серверах в `select` каждый сервер меряется
+// ещё и отдельно, через свой выход (paths.servers), по кругу с direct и vpn.
 //
 // Службы ядра: Comparer стартует и останавливается вместе с экземпляром sing-box.
-// Замеры идут прямо через выходы (direct и VPN), мимо маршрутизатора: правила не участвуют.
+// Замеры идут прямо через выходы (direct, VPN, серверы), мимо маршрутизатора: правила не участвуют.
 
 import (
 	"context"
@@ -69,9 +71,17 @@ type ComparePath struct {
 	Estimate  bool   `json:"estimate,omitempty"`
 }
 
+// CompareServerPath — дорога через один сервер из `select` (выход по тегу, не через `select`).
+type CompareServerPath struct {
+	Tag string `json:"tag"`
+	ComparePath
+}
+
 type ComparePaths struct {
 	Direct *ComparePath `json:"direct"`
-	VPN    *ComparePath `json:"vpn"`
+	VPN    *ComparePath `json:"vpn"` // текущий выбор `select`: для старых версий приложения
+	// Серверы в порядке `select`, без групп; пусто, если сервер один (тогда он и есть vpn).
+	Servers []*CompareServerPath `json:"servers"`
 }
 
 // CompareResult — ответ ядра (res-<id>.json).
@@ -97,7 +107,7 @@ func newCompareResult(id string, now time.Time) *CompareResult {
 		V:       CompareFormatVersion,
 		ID:      id,
 		Started: now.UnixMilli(),
-		Paths:   ComparePaths{Direct: newComparePath(), VPN: newComparePath()},
+		Paths:   ComparePaths{Direct: newComparePath(), VPN: newComparePath(), Servers: []*CompareServerPath{}},
 	}
 }
 
@@ -246,6 +256,9 @@ func closeUnfinishedResult(dir, id, path string, now time.Time) {
 	if res.Paths.VPN == nil {
 		res.Paths.VPN = newComparePath()
 	}
+	if res.Paths.Servers == nil {
+		res.Paths.Servers = []*CompareServerPath{}
+	}
 	res.Done = true
 	res.Finished = now.UnixMilli()
 	res.Error = "ядро было перезапущено во время проверки"
@@ -258,6 +271,7 @@ type CompareOptions struct {
 	Dir            string
 	TestURL        string // connection-test-url: оценка качества VPN при методе icmp
 	VPNOutbound    string
+	SelectTag      string // выход-селектор: из него берутся серверы (пусто — без paths.servers)
 	DirectOutbound string
 	DirectDNS      string // тег DNS-сервера «напрямую»; пусто или нет такого — системный резолвер
 	Now            func() time.Time
@@ -341,11 +355,12 @@ type compareRun struct {
 	now  func() time.Time
 
 	// Подменяются в тестах.
-	vpnDialer    func() N.Dialer
-	directDialer func() N.Dialer
-	resolve      resolveFunc
-	ping         icmpFunc
-	urlTest      probeFunc
+	vpnDialer     func() N.Dialer
+	directDialer  func() N.Dialer
+	serverDialers func() []serverDialer
+	resolve       resolveFunc
+	ping          icmpFunc
+	urlTest       probeFunc
 
 	scanEvery time.Duration
 	pause     time.Duration
@@ -384,25 +399,62 @@ func newCompareRun(opts CompareOptions, outbounds adapter.OutboundManager) *comp
 		}
 		return nil
 	}
+	r.serverDialers = func() []serverDialer {
+		return pickServerOutbounds(outbounds, opts.SelectTag)
+	}
 	r.ping = newOutboundPing(func() adapter.Outbound {
 		return pickDirectOutbound(outbounds, opts.DirectOutbound)
 	}, systemPing)
 	return r
 }
 
+// serverDialer — выход одного сервера.
+type serverDialer struct {
+	tag    string
+	dialer N.Dialer
+}
+
+// pickServerOutbounds — выходы серверов из `select` по порядку, без групп (тот же список, что
+// у сторожа). Сервер один — nil: он и так меряется как vpn.
+func pickServerOutbounds(outbounds adapter.OutboundManager, selectTag string) []serverDialer {
+	if outbounds == nil || selectTag == "" {
+		return nil
+	}
+	ob, ok := outbounds.Outbound(selectTag)
+	if !ok {
+		return nil
+	}
+	group, ok := ob.(adapter.OutboundGroup)
+	if !ok {
+		return nil
+	}
+	tags := failoverServers(outbounds, group.All())
+	if len(tags) < 2 {
+		return nil
+	}
+	res := make([]serverDialer, 0, len(tags))
+	for _, tag := range tags {
+		if ob, ok := outbounds.Outbound(tag); ok {
+			res = append(res, serverDialer{tag: tag, dialer: ob})
+		}
+	}
+	return res
+}
+
 func newCompareRunBase(opts CompareOptions) *compareRun {
 	return &compareRun{
-		dir:       opts.Dir,
-		opts:      opts,
-		now:       opts.Now,
-		resolve:   systemResolve,
-		ping:      systemPing,
-		urlTest:   urlTestProbe,
-		scanEvery: compareScanInterval,
-		pause:     comparePause,
-		timeout:   compareMeasureTO,
-		known:     make(map[string]struct{}),
-		wake:      make(chan struct{}, 1),
+		dir:           opts.Dir,
+		opts:          opts,
+		now:           opts.Now,
+		resolve:       systemResolve,
+		ping:          systemPing,
+		urlTest:       urlTestProbe,
+		serverDialers: func() []serverDialer { return nil },
+		scanEvery:     compareScanInterval,
+		pause:         comparePause,
+		timeout:       compareMeasureTO,
+		known:         make(map[string]struct{}),
+		wake:          make(chan struct{}, 1),
 	}
 }
 

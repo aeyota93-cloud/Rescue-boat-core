@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sagernet/sing-box/adapter"
 	M "github.com/sagernet/sing/common/metadata"
 	N "github.com/sagernet/sing/common/network"
 )
@@ -86,11 +87,12 @@ func newCmpServer(t *testing.T, name string, log *cmpLog, keepAlive bool) *cmpSe
 
 // fakeDialer — N.Dialer: все соединения идут на addr (пусто — отказ).
 type fakeDialer struct {
-	addr  string
-	delay time.Duration
-	mu    sync.Mutex
-	dests []M.Socksaddr
-	dials atomic.Int32
+	addr     string
+	delay    time.Duration
+	mu       sync.Mutex
+	dests    []M.Socksaddr
+	dials    atomic.Int32
+	urlTests atomic.Int32 // оценок качества через этот выход (icmp)
 }
 
 func (d *fakeDialer) DialContext(ctx context.Context, network string, dest M.Socksaddr) (net.Conn, error) {
@@ -146,12 +148,24 @@ func cmpTempDir(t *testing.T) string {
 }
 
 type cmpEnv struct {
-	dir    string
-	run    *compareRun
-	direct *fakeDialer
-	vpn    *fakeDialer
-	pings  atomic.Int32
-	tests  atomic.Int32
+	dir     string
+	run     *compareRun
+	direct  *fakeDialer
+	vpn     *fakeDialer
+	servers []serverDialer // пусто — сервер один, paths.servers нет
+	pings   atomic.Int32
+	tests   atomic.Int32
+}
+
+// withServers — серверы из select по порядку, у каждого свой выход.
+func (e *cmpEnv) withServers(tags ...string) []*fakeDialer {
+	var ds []*fakeDialer
+	for _, tag := range tags {
+		d := &fakeDialer{}
+		ds = append(ds, d)
+		e.servers = append(e.servers, serverDialer{tag: tag, dialer: d})
+	}
+	return ds
 }
 
 func newCmpEnv(t *testing.T) *cmpEnv {
@@ -160,6 +174,7 @@ func newCmpEnv(t *testing.T) *cmpEnv {
 	e.run = newCompareRunBase(CompareOptions{Dir: e.dir, TestURL: "http://test.invalid/", Now: func() time.Time { return time.UnixMilli(1791640000000) }})
 	e.run.vpnDialer = func() N.Dialer { return e.vpn }
 	e.run.directDialer = func() N.Dialer { return e.direct }
+	e.run.serverDialers = func() []serverDialer { return e.servers }
 	e.run.resolve = func(ctx context.Context, host string) (netip.Addr, error) {
 		return netip.MustParseAddr("93.184.216.34"), nil
 	}
@@ -171,8 +186,11 @@ func newCmpEnv(t *testing.T) *cmpEnv {
 		if link != "http://test.invalid/" {
 			t.Errorf("urltest link = %q", link)
 		}
-		if dialer != N.Dialer(e.vpn) {
-			t.Errorf("urltest не через VPN-выход")
+		fd, ok := dialer.(*fakeDialer)
+		if !ok || fd == e.direct {
+			t.Errorf("urltest не через выход VPN или сервера")
+		} else {
+			fd.urlTests.Add(1)
 		}
 		n := e.tests.Add(1)
 		return time.Duration(10+n) * time.Millisecond, nil
@@ -613,6 +631,113 @@ func TestCompareDirectTLSResetStillCompares(t *testing.T) {
 	}
 }
 
+// --- серверы (docs/rescue-servers-v2.md) ---
+
+func TestCompareServersEachThroughOwnOutbound(t *testing.T) {
+	e := newCmpEnv(t)
+	log := &cmpLog{}
+	ds := newCmpServer(t, "direct", log, true)
+	vs := newCmpServer(t, "vpn", log, true)
+	s1 := newCmpServer(t, "s1", log, true)
+	s2 := newCmpServer(t, "s2", log, true)
+	e.direct.addr, e.vpn.addr = hostPort(ds), hostPort(vs)
+	sd := e.withServers("NL", "NL запасной")
+	sd[0].addr, sd[1].addr = hostPort(s1), hostPort(s2)
+
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 4})
+	if !res.Done || res.Error != "" || res.Method != MethodTLS {
+		t.Fatalf("итог: %+v", res)
+	}
+	// По кругу: direct, vpn, сервер 1, сервер 2, …
+	got := strings.Join(log.snapshot(), ",")
+	if want := strings.TrimSuffix(strings.Repeat("direct,vpn,s1,s2,", 4), ","); got != want {
+		t.Errorf("порядок запросов:\n got %s\nwant %s", got, want)
+	}
+	// Поле vpn осталось для старых версий приложения.
+	if p := res.Paths.VPN; !p.Available || p.FirstMS == nil || len(p.Samples) != 4 || nils(p.Samples) != 0 {
+		t.Errorf("vpn: %+v", p)
+	}
+	if len(res.Paths.Servers) != 2 || res.Paths.Servers[0].Tag != "NL" || res.Paths.Servers[1].Tag != "NL запасной" {
+		t.Fatalf("servers: %+v", res.Paths.Servers)
+	}
+	for i, p := range res.Paths.Servers {
+		if !p.Available || p.FirstMS == nil || len(p.Samples) != 4 || nils(p.Samples) != 0 || p.Estimate || p.Note != "" {
+			t.Errorf("%s: %+v %s", p.Tag, p.ComparePath, fmtSamples(p.Samples))
+		}
+		// Каждый сервер — через свой выход, домен резолвит сам выход, одно соединение (keep-alive).
+		if d := sd[i].destinations(); len(d) == 0 || d[0].Fqdn != "example.test" || d[0].Port != 443 {
+			t.Errorf("%s dest: %v", p.Tag, d)
+		}
+		if n := sd[i].dials.Load(); n != 1 {
+			t.Errorf("%s: соединений %d", p.Tag, n)
+		}
+	}
+	raw, _ := os.ReadFile(compareResPath(e.dir, "abcd1234"))
+	if !strings.Contains(string(raw), `"servers":[{"tag":"NL","available":true,"first_ms":`) {
+		t.Errorf("формат servers: %s", raw)
+	}
+}
+
+func TestCompareServerDownIsNulls(t *testing.T) {
+	e := newCmpEnv(t)
+	e.run.timeout = 100 * time.Millisecond
+	log := &cmpLog{}
+	ds := newCmpServer(t, "direct", log, true)
+	vs := newCmpServer(t, "vpn", log, true)
+	e.direct.addr, e.vpn.addr = hostPort(ds), hostPort(vs)
+	sd := e.withServers("NL", "NL запасной") // запасной не отвечает
+	sd[0].addr = hostPort(vs)
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 3})
+	if res.Method != MethodTLS || res.Error != "" || len(res.Paths.Servers) != 2 {
+		t.Fatalf("итог: %+v", res)
+	}
+	alive, down := res.Paths.Servers[0], res.Paths.Servers[1]
+	if !alive.Available || nils(alive.Samples) != 0 || len(alive.Samples) != 3 {
+		t.Errorf("живой: %+v %s", alive.ComparePath, fmtSamples(alive.Samples))
+	}
+	if down.FirstMS != nil || len(down.Samples) != 3 || nils(down.Samples) != 3 {
+		t.Errorf("мёртвый: %+v %s", down.ComparePath, fmtSamples(down.Samples))
+	}
+}
+
+// Сервер один (или нет select) — servers пустой массив, всё как в v1.
+func TestCompareNoServersIsEmptyArray(t *testing.T) {
+	e := newCmpEnv(t)
+	log := &cmpLog{}
+	ds := newCmpServer(t, "direct", log, true)
+	vs := newCmpServer(t, "vpn", log, true)
+	e.direct.addr, e.vpn.addr = hostPort(ds), hostPort(vs)
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 3})
+	if res.Error != "" || len(res.Paths.Servers) != 0 {
+		t.Fatalf("итог: %+v", res)
+	}
+	raw, _ := os.ReadFile(compareResPath(e.dir, "abcd1234"))
+	if !strings.Contains(string(raw), `"servers":[]`) {
+		t.Errorf("servers не пустой массив: %s", raw)
+	}
+	if got := strings.Join(log.snapshot(), ","); got != "direct,vpn,direct,vpn,direct,vpn" {
+		t.Errorf("порядок: %s", got)
+	}
+}
+
+func TestCompareServersTCPOnly(t *testing.T) {
+	e := newCmpEnv(t)
+	e.run.timeout = 150 * time.Millisecond
+	e.direct.addr = newClosingListener(t)
+	e.vpn.addr = e.direct.addr
+	sd := e.withServers("NL", "NL запасной")
+	sd[0].addr, sd[1].addr = e.direct.addr, e.direct.addr
+	res := e.measure(t, CompareRequest{Target: "example.test", Count: 3})
+	if res.Error != "" || !res.Done || len(res.Paths.Direct.Samples) != 3 || len(res.Paths.Servers) != 2 {
+		t.Fatalf("итог: %+v", res)
+	}
+	for _, p := range res.Paths.Servers {
+		if p.Available || p.Note == "" || p.Note != res.Paths.VPN.Note || len(p.Samples) != 0 {
+			t.Errorf("%s: %+v", p.Tag, p.ComparePath)
+		}
+	}
+}
+
 // --- icmp ---
 
 func TestCompareICMPFallback(t *testing.T) {
@@ -664,6 +789,42 @@ func TestCompareICMPTimeouts(t *testing.T) {
 	res := e.measure(t, CompareRequest{Target: "game.example.test", Port: 27015, Count: 3})
 	if nils(res.Paths.Direct.Samples) != 3 || !res.Paths.Direct.Available || res.Paths.Direct.Note == "" {
 		t.Errorf("direct: %+v", res.Paths.Direct)
+	}
+}
+
+func TestCompareICMPServersEstimate(t *testing.T) {
+	e := newCmpEnv(t) // все выходы отказывают: игровой сервер только по UDP
+	e.run.timeout = 100 * time.Millisecond
+	sd := e.withServers("NL", "NL игры")
+	res := e.measure(t, CompareRequest{Target: "game.example.test", Port: 27015, Count: 3})
+	if res.Error != "" || !res.Done || res.Method != MethodICMP {
+		t.Fatalf("итог: %+v", res)
+	}
+	if len(res.Paths.Direct.Samples) != 3 || !res.Paths.VPN.Estimate || len(res.Paths.VPN.Samples) != 3 {
+		t.Errorf("direct/vpn: %+v %+v", res.Paths.Direct, res.Paths.VPN)
+	}
+	if len(res.Paths.Servers) != 2 {
+		t.Fatalf("servers: %+v", res.Paths.Servers)
+	}
+	for i, p := range res.Paths.Servers {
+		if p.Available || !p.Estimate || p.Note != noteICMPVPN || p.FirstMS != nil {
+			t.Errorf("%s: %+v", p.Tag, p.ComparePath)
+		}
+		if len(p.Samples) != 3 || nils(p.Samples) != 0 {
+			t.Errorf("%s samples: %s", p.Tag, fmtSamples(p.Samples))
+		}
+		// Качество туннеля — через выход этого сервера.
+		if n := sd[i].urlTests.Load(); n != 3 {
+			t.Errorf("%s: оценок через свой выход %d", p.Tag, n)
+		}
+	}
+	if n := e.vpn.urlTests.Load(); n != 3 {
+		t.Errorf("vpn: оценок %d", n)
+	}
+	// По кругу: оценки vpn, сервер 1, сервер 2 идут подряд (подделка возвращает 10+n мс).
+	v, a, b := res.Paths.VPN.Samples, res.Paths.Servers[0].Samples, res.Paths.Servers[1].Samples
+	if *v[0] != 11 || *a[0] != 12 || *b[0] != 13 || *v[1] != 14 {
+		t.Errorf("порядок оценок: vpn %s, 1: %s, 2: %s", fmtSamples(v), fmtSamples(a), fmtSamples(b))
 	}
 }
 
@@ -886,5 +1047,49 @@ func TestSystemPingLoopback(t *testing.T) {
 	}
 	if d <= 0 || d > 2*time.Second {
 		t.Errorf("rtt = %v", d)
+	}
+}
+
+// listGroup — группа с несколькими выходами (select, lowest, balance).
+type listGroup struct {
+	fakeGroup
+	all []string
+}
+
+func (g *listGroup) All() []string { return g.all }
+
+func TestPickServerOutbounds(t *testing.T) {
+	group := func(tag string, all ...string) *listGroup {
+		return &listGroup{fakeGroup: fakeGroup{fakeOutbound: fakeOutbound{tag: tag}}, all: all}
+	}
+	nl := &fakeOutbound{tag: "NL", typ: "vless"}
+	games := &fakeOutbound{tag: "NL игры", typ: "hysteria2"}
+	backup := &fakeOutbound{tag: "NL запасной", typ: "vless"}
+	obs := &fakeOutbounds{list: []adapter.Outbound{
+		group("select", "lowest", "balance", "NL", "NL запасной", "пропал", "NL игры"),
+		group("lowest", "NL", "NL запасной", "NL игры"),
+		group("balance", "NL", "NL запасной", "NL игры"),
+		nl, backup, games,
+	}}
+	got := pickServerOutbounds(obs, "select")
+	var tags []string
+	for _, s := range got {
+		tags = append(tags, s.tag)
+	}
+	if strings.Join(tags, ",") != "NL,NL запасной,NL игры" {
+		t.Fatalf("серверы: %v", tags)
+	}
+	if got[0].dialer != N.Dialer(nl) || got[2].dialer != N.Dialer(games) {
+		t.Error("выход сервера не тот")
+	}
+	if pickServerOutbounds(obs, "") != nil || pickServerOutbounds(obs, "нет такого") != nil || pickServerOutbounds(nil, "select") != nil {
+		t.Error("без select серверов быть не должно")
+	}
+	if pickServerOutbounds(obs, "NL") != nil {
+		t.Error("select — не группа")
+	}
+	one := &fakeOutbounds{list: []adapter.Outbound{group("select", "NL"), nl}}
+	if pickServerOutbounds(one, "select") != nil {
+		t.Error("один сервер — он и есть vpn, servers не нужен")
 	}
 }

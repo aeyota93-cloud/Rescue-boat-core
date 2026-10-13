@@ -8,12 +8,18 @@ package config
 //   bypass-vpn.json      то же — всегда мимо VPN;
 //   bypass-domains.json  только сайты из bypass-vpn.json: их DNS тоже идёт мимо VPN;
 //   via-domains.json     только сайты из via-vpn.json: их DNS идёт через VPN и не режется
-//                        блокировкой рекламы (файл необязательный, без него — пустой).
+//                        блокировкой рекламы (файл необязательный, без него — пустой);
+//   via-server-<key>.json  то, что пользователь закрепил за одним сервером из `select`
+//                        (docs/rescue-servers-v2.md, key — ServerKey(тег)); файлы есть только
+//                        для серверов профиля и только когда серверов два и больше.
 // Это локальные наборы правил: sing-box следит за файлами и перечитывает их при изменении,
 // а поиск программ включает сам, как только в наборе появляется правило по программе.
-// Оба списка стоят выше всех остальных правил (сервера, региона, пользовательских).
+// Списки стоят выше всех остальных правил (сервера, региона, пользовательских); закреплённое
+// за сервером — выше «через VPN».
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,11 +28,19 @@ import (
 	"github.com/sagernet/sing-box/option"
 )
 
+// ServerKey — ключ сервера для имён файлов (docs/rescue-servers-v2.md): первые 12 символов
+// hex(sha256(UTF-8 тега)), строчные. Приложение считает так же.
+func ServerKey(tag string) string {
+	sum := sha256.Sum256([]byte(tag))
+	return hex.EncodeToString(sum[:6])
+}
+
 const (
 	splitViaTag           = "rescue-via-vpn"
 	splitViaDomainsTag    = "rescue-via-domains"
 	splitBypassTag        = "rescue-bypass-vpn"
 	splitBypassDomainsTag = "rescue-bypass-domains"
+	splitViaServerPrefix  = "rescue-via-server-"
 )
 
 // Пустой набор правил: файл должен существовать, иначе sing-box не запустится.
@@ -49,7 +63,39 @@ func ruleSetPath(p string) string {
 	return p
 }
 
-func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
+// selectServers — серверы из выхода `select` по порядку, без групп (lowest, balance, другие
+// селекторы). Тот же список, что у сторожа (rescuestats.failoverServers), но по options при
+// сборке конфига: выходы и endpoint'ы (WireGuard и т. п.) — серверы, группы — нет.
+func selectServers(options *option.Options) []string {
+	if options == nil {
+		return nil
+	}
+	known := make(map[string]bool) // тег → это сервер (не группа)
+	var members []string
+	for _, out := range options.Outbounds {
+		switch out.Type {
+		case C.TypeSelector, C.TypeURLTest, C.TypeBalancer:
+			known[out.Tag] = false
+			if sel, ok := out.Options.(*option.SelectorOutboundOptions); ok && out.Tag == OutboundSelectTag {
+				members = sel.Outbounds
+			}
+		default:
+			known[out.Tag] = true
+		}
+	}
+	for _, end := range options.Endpoints {
+		known[end.Tag] = true
+	}
+	var servers []string
+	for _, tag := range members {
+		if known[tag] {
+			servers = append(servers, tag)
+		}
+	}
+	return servers
+}
+
+func splitTunnelRules(options *option.Options, hopt *HiddifyOptions) rescueRules {
 	var res rescueRules
 	if hopt.SplitTunnelDir == "" {
 		return res
@@ -76,7 +122,23 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 		local(splitBypassTag, "bypass-vpn.json"),
 		local(splitBypassDomainsTag, "bypass-domains.json"),
 	}
-	res.route = []option.Rule{
+	// Пункты, закреплённые за сервером: свой набор на каждый сервер и правило прямо на его
+	// выход, выше «через VPN». При одном сервере закреплять не за что — как раньше.
+	if servers := selectServers(options); len(servers) >= 2 {
+		for _, tag := range servers {
+			key := ServerKey(tag)
+			setTag := splitViaServerPrefix + key
+			res.ruleSets = append(res.ruleSets, local(setTag, "via-server-"+key+".json"))
+			res.route = append(res.route, option.Rule{
+				Type: C.RuleTypeDefault,
+				DefaultOptions: option.DefaultRule{
+					RawDefaultRule: option.RawDefaultRule{RuleSet: []string{setTag}},
+					RuleAction:     routeAction(tag),
+				},
+			})
+		}
+	}
+	res.route = append(res.route, []option.Rule{
 		{
 			Type: C.RuleTypeDefault,
 			DefaultOptions: option.DefaultRule{
@@ -91,7 +153,7 @@ func splitTunnelRules(hopt *HiddifyOptions) rescueRules {
 				RuleAction:     routeAction(OutboundDirectTag),
 			},
 		},
-	}
+	}...)
 	// Вкладка «Сейчас в сети» показывает, какая программа куда идёт: имя процесса нужно для
 	// каждого соединения, а не только когда в списках есть программы.
 	res.findProcess = isWindows
