@@ -1,0 +1,62 @@
+# Сторож совместимости: каждый понедельник свежий Xray (сервер Reality) против ядра Шлюпки.
+# Красный запуск = новый Xray не пускает Шлюпку: GitHub пришлёт письмо. Сервер тогда не
+# обновлять, пока не исправлено ядро (так было 30.10.2026: Xray 26.9.8+, патч 0001).
+# Проверяются: версия на нашем сервере (XRAY_SERVER — менять вместе с узлом PasarGuard),
+# последняя стабильная и самая свежая предварительная, если она новее.
+name: Xray compatibility
+
+on:
+  schedule:
+    - cron: '17 6 * * 1' # понедельник, 09:17 по Москве
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/xray-compat.yml
+      - scripts/xray-compat.sh
+      - patches/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  XRAY_SERVER: v26.3.27
+
+jobs:
+  reality:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Патчи Шлюпки к hiddify-sing-box
+        run: |
+          for p in patches/hiddify-sing-box/*.patch; do
+            git -C hiddify-sing-box apply --verbose "../$p"
+          done
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Клиент — ядро Шлюпки (sing-box с патчами)
+        working-directory: hiddify-sing-box
+        run: go build -tags with_utls -o ../bin/sing-box ./cmd/sing-box
+
+      - name: Xray — версия сервера и самые свежие
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api 'repos/XTLS/Xray-core/releases?per_page=30' --jq '
+            ([.[] | select(.prerelease | not)][0].tag_name), .[0].tag_name')
+          for tag in $(printf '%s\n' "$XRAY_SERVER" $tags | awk '!seen[$0]++'); do
+            mkdir -p "xray/$tag"
+            gh release download "$tag" -R XTLS/Xray-core -p Xray-linux-64.zip -D "xray/$tag"
+            unzip -q "xray/$tag/Xray-linux-64.zip" xray -d "xray/$tag"
+            echo "Xray $tag"
+          done
+
+      - name: Проверка
+        run: bash scripts/xray-compat.sh bin/sing-box xray/*/xray
