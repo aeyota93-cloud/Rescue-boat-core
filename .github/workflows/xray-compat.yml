@@ -45,7 +45,8 @@ jobs:
 
       - name: Клиент — ядро Шлюпки (sing-box с патчами)
         working-directory: hiddify-sing-box
-        run: go build -tags with_utls -o ../bin/sing-box ./cmd/sing-box
+        # with_grpc — как в настоящей сборке ядра (Makefile): иначе проверялся бы grpc-lite.
+        run: go build -tags with_utls,with_grpc -o ../bin/sing-box ./cmd/sing-box
 
       - name: Xray — версия сервера и самые свежие
         env:

@@ -21,6 +21,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Запрос через туннель клиента. -q и --noproxy '': переменные окружения (NO_PROXY=* и т.п.)
+# не должны пустить curl мимо туннеля — это был бы ложный «ok».
+probe() {
+	curl -q -s -m 10 --noproxy '' -o /dev/null -w '%{http_code}' -x "socks5h://127.0.0.1:$1" \
+		https://www.gstatic.com/generate_204 || true
+}
+
 fail=0
 port=24000
 summary="| Xray | транспорт | Шлюпка (chrome) |"$'\n'"|---|---|---|"
@@ -72,8 +79,7 @@ EOF
 
 		code=000
 		for _ in 1 2 3; do
-			code=$(curl -s -m 10 -o /dev/null -w '%{http_code}' -x "socks5h://127.0.0.1:$cport" \
-				https://www.gstatic.com/generate_204 || true)
+			code=$(probe "$cport")
 			[ "$code" = 204 ] && break
 			sleep 2
 		done
@@ -87,6 +93,26 @@ EOF
 			summary+=$'\n'"| $ver | $mode | ❌ не пускает |"
 		fi
 	done
+
+	# Обратная проверка: тот же сервер, клиент с чужим ключом Reality — должен НЕ пройти.
+	# Если проходит, проверка выше ничего не доказывает (запрос идёт мимо Reality).
+	badkeys=$("$xray" x25519)
+	badpub=$(grep -i -m1 -E 'public|password' <<<"$badkeys" | awk -F': *' '{print $2}')
+	sed "s#\"public_key\":\"$pub\"#\"public_key\":\"$badpub\"#" "$work/client-$ver-vision.json" >"$work/client-$ver-bad.json"
+	bport=$port
+	port=$((port + 2))
+	sed -i "s#\"listen_port\":[0-9]*#\"listen_port\":$bport#" "$work/client-$ver-bad.json"
+	"$sb" run -c "$work/client-$ver-bad.json" >"$work/client-$ver-bad.log" 2>&1 &
+	pids+=($!)
+	sleep 2
+	if [ "$(probe "$bport")" = 204 ]; then
+		fail=1
+		echo "FAIL  Xray $ver: клиент с чужим ключом тоже прошёл — проверка недостоверна"
+		summary+=$'\n'"| $ver | чужой ключ | ❌ прошёл (проверка недостоверна) |"
+	else
+		echo "ok    Xray $ver: чужой ключ не пускает (проверка достоверна)"
+		summary+=$'\n'"| $ver | чужой ключ | ✅ не пускает |"
+	fi
 done
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
