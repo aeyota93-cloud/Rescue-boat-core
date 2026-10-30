@@ -61,6 +61,8 @@ jobs:
           done
 
       - name: Проверка
+        # shell: bash — с pipefail: иначе tee прячет код ошибки и красный запуск выглядит зелёным.
+        shell: bash
         run: bash scripts/xray-compat.sh bin/sing-box xray/*/xray | tee report.txt
 
       - name: Telegram
