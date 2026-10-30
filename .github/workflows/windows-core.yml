@@ -34,6 +34,14 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # hiddify-sing-box — чужой подмодуль (Hiddify): свои правки к нему держим патчами здесь.
+      # 0001: Reality шлёт X25519MLKEM768 — без него Xray 26.9.8+ не пускает (sing-box#4520).
+      - name: Патчи Шлюпки к hiddify-sing-box
+        run: |
+          for p in patches/hiddify-sing-box/*.patch; do
+            git -C hiddify-sing-box apply --verbose "../$p"
+          done
+
       - name: MinGW
         run: sudo apt-get update -qq && sudo apt-get install -y -qq gcc-mingw-w64-x86-64
 

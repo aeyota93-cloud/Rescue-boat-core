@@ -1,0 +1,55 @@
+diff --git a/common/tls/reality_client.go b/common/tls/reality_client.go
+index 9362d2f..bcd7691 100644
+--- a/common/tls/reality_client.go
++++ b/common/tls/reality_client.go
+@@ -130,21 +130,39 @@ func (e *RealityClientConfig) ClientHandshake(ctx context.Context, conn net.Conn
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	var mlkemCurve, mlkemKeyShare bool
+ 	for _, extension := range uConn.Extensions {
+-		if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
+-			ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
+-				return curveID != utls.X25519MLKEM768
+-			})
+-		}
+-		if ks, ok := extension.(*utls.KeyShareExtension); ok {
+-			ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
+-				return share.Group != utls.X25519MLKEM768
++		switch ext := extension.(type) {
++		case *utls.SupportedCurvesExtension:
++			mlkemCurve = common.Contains(ext.Curves, utls.X25519MLKEM768)
++		case *utls.KeyShareExtension:
++			mlkemKeyShare = common.Any(ext.KeyShares, func(share utls.KeyShare) bool {
++				return share.Group == utls.X25519MLKEM768
+ 			})
+ 		}
+ 	}
+-	err = uConn.BuildHandshakeState()
+-	if err != nil {
+-		return nil, err
++	// Rescue Boat: Xray-core since v26.9.8 rejects a ClientHello without the X25519MLKEM768 share
++	// ahead of X25519 (sing-box#4520). Keep it when the fingerprint sends both the group and the
++	// share; strip an incomplete pair (randomized fingerprints): a group without a share draws a
++	// HelloRetryRequest that REALITY cannot relay, a share without its group breaks RFC 8446 4.2.8.
++	// The session id is still sealed with the standalone X25519 share (KeyShareKeys.Ecdhe).
++	if mlkemCurve != mlkemKeyShare {
++		for _, extension := range uConn.Extensions {
++			if ce, ok := extension.(*utls.SupportedCurvesExtension); ok {
++				ce.Curves = common.Filter(ce.Curves, func(curveID utls.CurveID) bool {
++					return curveID != utls.X25519MLKEM768
++				})
++			}
++			if ks, ok := extension.(*utls.KeyShareExtension); ok {
++				ks.KeyShares = common.Filter(ks.KeyShares, func(share utls.KeyShare) bool {
++					return share.Group != utls.X25519MLKEM768
++				})
++			}
++		}
++		err = uConn.BuildHandshakeState()
++		if err != nil {
++			return nil, err
++		}
+ 	}
+ 
+ 	if len(uConfig.NextProtos) > 0 {
