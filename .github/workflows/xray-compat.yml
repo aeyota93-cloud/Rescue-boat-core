@@ -3,6 +3,8 @@
 # обновлять, пока не исправлено ядро (так было 30.10.2026: Xray 26.9.8+, патч 0001).
 # Проверяются: версия на нашем сервере (XRAY_SERVER — менять вместе с узлом PasarGuard),
 # последняя стабильная и самая свежая предварительная, если она новее.
+# Telegram: секреты репозитория TG_TOKEN (бот) и TG_CHAT_ID (кому). Пишет при поломке и при
+# ручном запуске (кнопка Run workflow — проверить, что сообщения доходят). Нет секретов — молчит.
 name: Xray compatibility
 
 on:
@@ -59,4 +61,25 @@ jobs:
           done
 
       - name: Проверка
-        run: bash scripts/xray-compat.sh bin/sing-box xray/*/xray
+        run: bash scripts/xray-compat.sh bin/sing-box xray/*/xray | tee report.txt
+
+      - name: Telegram
+        if: always() && (failure() || github.event_name == 'workflow_dispatch')
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          RESULT: ${{ job.status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then echo "Telegram не настроен"; exit 0; fi
+          lines=$(grep -E '^(ok|FAIL)' report.txt 2>/dev/null || true)
+          if [ "$RESULT" = success ]; then
+            text="✅ Сторож Шлюпки: все проверенные Xray пускают Шлюпку."
+          else
+            text="🚨 Сторож Шлюпки: проверка не прошла. Сервер VPN не обновлять, пока не починим."
+          fi
+          text="$text"$'\n\n'"${lines:-нет результатов — упала сама проверка}"$'\n\n'"$RUN_URL"
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST "https://api.telegram.org/bot$TG_TOKEN/sendMessage" \
+            --data-urlencode "chat_id=$TG_CHAT_ID" --data-urlencode "text=$text")
+          echo "Telegram: $code"
+          [ "$code" = 200 ]
