@@ -298,6 +298,10 @@ func newFailoverHarness(t *testing.T, tags []string, dir string, ignoreCancel bo
 }
 
 func newFailoverHarnessWithParent(t *testing.T, parent context.Context, tags []string, dir string, ignoreCancel bool, initial ...string) *failoverHarness {
+	return newFailoverHarnessWithProbe(t, parent, tags, dir, ignoreCancel, nil, initial...)
+}
+
+func newFailoverHarnessWithProbe(t *testing.T, parent context.Context, tags []string, dir string, ignoreCancel bool, wrap func(failoverProbe) failoverProbe, initial ...string) *failoverHarness {
 	t.Helper()
 	h := &failoverHarness{t: t, clock: newFailoverClock(), sel: &fakeSelector{now: tags[0]}, ticks: make(chan time.Time),
 		calls: make(chan probeCall, 100), events: make(chan machineSnapshot, 100), stopped: make(chan struct{}),
@@ -319,6 +323,9 @@ func newFailoverHarnessWithParent(t *testing.T, parent context.Context, tags []s
 		case <-ctx.Done():
 			return failoverResult{Canceled: ctx.Err() == context.Canceled}
 		}
+	}
+	if wrap != nil {
+		check = wrap(check)
 	}
 	h.r = newFailoverRun(parent, FailoverOptions{StatsDir: dir, Now: h.clock.now, Log: func(msg string) { h.logs <- msg }}, h.sel, tags, check,
 		func(d time.Duration) (<-chan time.Time, func()) {
@@ -485,36 +492,199 @@ func TestFailoverRunBrokenBatch(t *testing.T) {
 	}
 }
 
-func TestFailoverRunFullTimeoutBounds(t *testing.T) {
-	h := newFailoverHarness(t, []string{"A", "B"}, "", false)
+func TestFailoverProbePanicReleasesOrphan(t *testing.T) {
+	workers := newFailoverWorkers()
+	work := workers.begin("A")
+	started, release := make(chan struct{}), make(chan struct{})
+	replies, logs := make(chan failoverReply, 1), make(chan string, 2)
+	check := func(context.Context, string) failoverResult {
+		close(started)
+		<-release
+		panic("test")
+	}
+	go runFailoverProbe(context.Background(), check, workers, work, 1, replies, func(msg string) { logs <- msg })
+	<-started
+	workers.detach(work)
+	close(release)
+	if reply := <-replies; reply.result.OK || reply.result.Canceled {
+		t.Fatal("panic must fail probe", reply)
+	}
+	if _, live := workers.waiting(); live != 0 || len(workers.orphans) != 0 {
+		t.Fatal("panic leaked registry entry", live, workers.orphans)
+	}
+	if len(logs) != 1 {
+		t.Fatal("expected one panic log", len(logs))
+	}
+}
+
+func TestFailoverRunContinuesAfterProbePanic(t *testing.T) {
+	var first atomic.Bool
+	h := newFailoverHarnessWithProbe(t, context.Background(), []string{"A", "B"}, "", false,
+		func(check failoverProbe) failoverProbe {
+			return func(ctx context.Context, tag string) failoverResult {
+				result := check(ctx, tag)
+				if tag == "A" && !first.Swap(true) {
+					panic("test")
+				}
+				return result
+			}
+		})
 	h.finish(h.collect(2), map[string]failoverResult{"A": working(10)})
-	lastSuccess := h.clock.now()
-	for i := 0; i < 5; i++ {
-		step := time.Second
-		if i == 0 {
-			step = 5 * time.Second
+	if !h.state.starting || h.orphanCount("A") != 0 {
+		t.Fatal(h.state)
+	}
+	if _, live := h.r.workers.waiting(); live != 0 {
+		t.Fatal("leaked worker", live)
+	}
+	h.tick(5*time.Second, 5*time.Second)
+	h.finish(h.collect(2), map[string]failoverResult{"A": working(10)})
+	if h.state.starting {
+		t.Fatal("loop did not continue", h.state)
+	}
+	h.monitor(working(10))
+	h.noSelection()
+	panicLogs := 0
+	for len(h.logs) > 0 {
+		if strings.Contains(<-h.logs, "паника") {
+			panicLogs++
 		}
-		h.tick(step, step)
-		calls := h.collect(1)
-		h.clock.advance(4*time.Second, 4*time.Second)
-		h.finish(calls, nil)
-		if i < 4 && h.state.searching {
-			t.Fatal("early recognition")
-		}
 	}
-	if !h.state.searching || h.clock.now().Sub(lastSuccess) != 29*time.Second {
-		t.Fatal("recognition must be at 29 seconds")
+	if panicLogs != 1 {
+		t.Fatal("expected one panic log", panicLogs)
 	}
-	calls := h.collect(2)
-	// Тик в 30 с не создаёт вторую партию поверх подтверждения в 29–33 с.
-	h.tick(time.Second, time.Second)
-	h.clock.advance(3*time.Second, 3*time.Second)
-	h.finish(calls, map[string]failoverResult{"B": working(20)})
-	if elapsed := h.clock.now().Sub(lastSuccess); elapsed != 33*time.Second || elapsed > 35*time.Second {
-		t.Fatal(elapsed)
+}
+
+func TestFailoverTransportPanic(t *testing.T) {
+	for _, part := range []string{"TCP", "UDP"} {
+		t.Run(part, func(t *testing.T) {
+			completed := make(chan struct{})
+			logs := make(chan string, 2)
+			tcp := func(context.Context, string, N.Dialer) (time.Duration, error) {
+				if part == "TCP" {
+					panic("test")
+				}
+				close(completed)
+				return time.Millisecond, nil
+			}
+			udp := func(context.Context, N.Dialer) error {
+				if part == "UDP" {
+					panic("test")
+				}
+				close(completed)
+				return nil
+			}
+			result := probeFailover(context.Background(), "test", nil, tcp, udp, func(msg string) { logs <- msg })
+			if result.OK || result.Canceled {
+				t.Fatal("panic must fail transport", result)
+			}
+			select {
+			case <-completed:
+			default:
+				t.Fatal("other transport did not complete")
+			}
+			if len(logs) != 1 || !strings.Contains(<-logs, part) {
+				t.Fatal("expected one transport panic log")
+			}
+		})
 	}
-	if h.sel.Now() != "B" {
-		t.Fatal("no failover by 35 seconds")
+}
+
+func TestFailoverMaxServers(t *testing.T) {
+	tags := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	h := newFailoverHarness(t, tags, "", false)
+	if !slices.Equal(h.r.servers, tags[:FailoverMaxServers]) {
+		t.Fatal(h.r.servers)
+	}
+	if len(h.logs) != 1 || !strings.Contains(<-h.logs, "первые 8") {
+		t.Fatal("expected one limit log")
+	}
+	h.finish(h.collect(4), map[string]failoverResult{"A": working(10)})
+	h.finish(h.collect(4), nil)
+	select {
+	case call := <-h.calls:
+		t.Fatal("ninth probe started", call.tag)
+	default:
+	}
+	// Внешний выбор за пределами списка не добавляет девятую пробу.
+	m := newFailoverMachine(h.r.servers, "I", h.clock.now())
+	m.starting, m.searching = false, true
+	b := m.next()
+	if len(b.tags) != FailoverMaxServers || b.tags[7] != "I" {
+		t.Fatal(b.tags)
+	}
+}
+
+func TestFailoverRunFullTimeoutBounds(t *testing.T) {
+	for _, candidate := range []bool{false, true} {
+		t.Run(fmt.Sprint("candidate=", candidate), func(t *testing.T) {
+			tags := []string{"A", "B", "C", "D", "E", "F", "G", "H"}
+			h := newFailoverHarness(t, tags, "", true)
+			h.finish(h.collect(4), map[string]failoverResult{"A": working(10)})
+			h.finish(h.collect(4), nil)
+			lastSuccess := h.clock.now()
+			var late []map[string]probeCall
+			for i := 0; i < 5; i++ {
+				step := time.Second
+				if i == 0 {
+					step = 5 * time.Second
+				}
+				h.tick(step, step)
+				calls := h.collect(1)
+				late = append(late, calls)
+				h.expire(calls)
+				if i < 4 && h.state.searching {
+					t.Fatal("early recognition")
+				}
+				if i < 4 {
+					// Освобождаем сироту поздней удачей, не сбрасывая неудачи.
+					h.finish(calls, map[string]failoverResult{"A": working(1)})
+					late = late[:len(late)-1]
+					if h.state.failures != i+1 {
+						t.Fatal("late success reset failures", h.state)
+					}
+				}
+			}
+			if !h.state.searching || h.clock.now().Sub(lastSuccess) != 29*time.Second {
+				t.Fatal("recognition must be at 29 seconds", h.state)
+			}
+			calls := h.collect(8)
+			h.tick(time.Second, time.Second)
+			if candidate {
+				// Кандидат ответил, остальные ждут общего срока.
+				h.finish(map[string]probeCall{"B": calls["B"]}, map[string]failoverResult{"B": working(20)})
+				delete(calls, "B")
+			}
+			h.clock.advance(3*time.Second, 3*time.Second)
+			for _, call := range calls {
+				call.ctx.(*failoverTestDeadline).expire()
+				break
+			}
+			h.processed(1)
+			if elapsed := h.clock.now().Sub(lastSuccess); elapsed != 33*time.Second || elapsed > 35*time.Second {
+				t.Fatal(elapsed)
+			}
+			if h.state.pending {
+				t.Fatal("no decision by deadline", h.state)
+			}
+			if candidate && h.sel.Now() != "B" {
+				t.Fatal("no failover by 35 seconds")
+			}
+			if !candidate {
+				h.noSelection()
+			}
+			before, history := h.state, h.sel.history()
+			late = append(late, calls)
+			for _, batch := range late {
+				results := make(map[string]failoverResult)
+				for tag := range batch {
+					results[tag] = working(1)
+				}
+				h.finish(batch, results)
+				if h.state != before || !slices.Equal(history, h.sel.history()) {
+					t.Fatal("late replies changed decision", h.state)
+				}
+			}
+		})
 	}
 }
 
@@ -673,7 +843,6 @@ func TestFailoverConcurrencyLimitAndDuplicates(t *testing.T) {
 	default:
 	}
 	h.finish(first, nil)
-	h.finish(h.collect(4), nil)
 	h.finish(h.collect(4), nil)
 	if !h.state.starting {
 		t.Fatal("startup ended without working server")
@@ -918,7 +1087,7 @@ func TestFailoverStartupWavesHaveFullDeadlines(t *testing.T) {
 	h := newFailoverHarness(t, tags, "", true)
 	start := h.clock.now()
 	var batches []map[string]probeCall
-	for _, size := range []int{4, 4, 1} {
+	for _, size := range []int{4, 4} {
 		calls := h.collect(size)
 		for _, call := range calls {
 			deadline, _ := call.ctx.Deadline()
@@ -934,7 +1103,7 @@ func TestFailoverStartupWavesHaveFullDeadlines(t *testing.T) {
 		batches = append(batches, calls)
 		h.expire(calls)
 	}
-	if h.state.pending || h.clock.now().Sub(start) != 3*FailoverTimeout {
+	if h.state.pending || h.clock.now().Sub(start) != 2*FailoverTimeout {
 		t.Fatal("wrong total startup deadline", h.state)
 	}
 	for _, calls := range batches {
@@ -948,7 +1117,6 @@ func TestFailoverBrokenParallelLimit(t *testing.T) {
 	h := newFailoverHarness(t, tags, "", false)
 	h.finish(h.collect(4), map[string]failoverResult{"A": working(10)})
 	h.finish(h.collect(4), nil)
-	h.finish(h.collect(1), nil)
 	for i := 0; i < 5; i++ {
 		h.monitor(failoverResult{})
 	}
@@ -961,10 +1129,9 @@ func TestFailoverBrokenParallelLimit(t *testing.T) {
 		t.Fatal("more than eight broken probes", call.tag)
 	default:
 	}
-	h.finish(first, nil)
-	h.finish(h.collect(1), map[string]failoverResult{"I": working(10)})
-	if !slices.Equal(h.sel.history(), []string{"I"}) {
-		t.Fatal("queued broken candidate was not selected", h.sel.history())
+	h.finish(first, map[string]failoverResult{"H": working(10)})
+	if !slices.Equal(h.sel.history(), []string{"H"}) {
+		t.Fatal("broken candidate was not selected", h.sel.history())
 	}
 }
 

@@ -86,6 +86,47 @@ type udpTestDialer struct {
 	conns map[M.Socksaddr]*udpTestConn
 }
 
+type udpPanicDialer struct{ udpTestDialer }
+
+func (udpPanicDialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
+	panic("test")
+}
+
+func TestProbeUDPTargetPanicReturnsFailure(t *testing.T) {
+	for _, stage := range []string{"listen", "write"} {
+		t.Run(stage, func(t *testing.T) {
+			dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
+			conn := newUDPTestConn()
+			conn.respond = func(*dns.Msg, M.Socksaddr) []udpTestPacket { panic("test") }
+			done := make(chan error, 1)
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			go func() {
+				if stage == "listen" {
+					done <- probeUDPTargets(ctx, udpPanicDialer{}, []M.Socksaddr{dst, dst})
+				} else {
+					done <- probeUDPTargets(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: conn}}, []M.Socksaddr{dst})
+				}
+			}()
+			select {
+			case err := <-done:
+				if err == nil || ctx.Err() != nil {
+					t.Fatal("panic must return failure before deadline", err)
+				}
+			case <-ctx.Done():
+				t.Fatal("collector hung after target panic")
+			}
+			if stage == "write" {
+				select {
+				case <-conn.closed:
+				default:
+					t.Fatal("panicked target did not close connection")
+				}
+			}
+		})
+	}
+}
+
 type udpBlockedDialer struct {
 	udpTestDialer
 	started chan struct{}

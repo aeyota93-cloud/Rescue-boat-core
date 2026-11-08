@@ -51,7 +51,14 @@ func probeUDPTargetsWithTimeout(ctx context.Context, dialer N.Dialer, targets []
 		workers.Add(1)
 		go func(dst M.Socksaddr) {
 			defer workers.Done()
-			results <- probeUDPTarget(probeCtx, dialer, dst, query, wire)
+			ok := false
+			defer func() {
+				if recover() != nil {
+					ok = false
+				}
+				results <- ok
+			}()
+			ok = probeUDPTarget(probeCtx, dialer, dst, query, wire)
 		}(dst)
 	}
 	ok := false
@@ -72,7 +79,7 @@ func probeUDPTargetsWithTimeout(ctx context.Context, dialer N.Dialer, targets []
 	return errors.New("нет корректного ответа UDP")
 }
 
-func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query *dns.Msg, wire []byte) bool {
+func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query *dns.Msg, wire []byte) (ok bool) {
 	pc, err := dialer.ListenPacket(ctx, dst)
 	if err != nil {
 		return false
@@ -84,8 +91,14 @@ func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query
 	// Закрытие прерывает чтение даже у обёрток без поддержки deadline.
 	stop := make(chan struct{})
 	closed := make(chan struct{})
+	closePanicked := false
 	go func() {
 		defer close(closed)
+		defer func() {
+			if recover() != nil {
+				closePanicked = true
+			}
+		}()
 		select {
 		case <-ctx.Done():
 		case <-stop:
@@ -95,6 +108,9 @@ func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query
 	defer func() {
 		close(stop)
 		<-closed
+		if closePanicked {
+			ok = false
+		}
 	}()
 	// Многие пакетные соединения выходов sing (hysteria2, vless/xudp) deadline не поддерживают и
 	// возвращают ошибку — это не повод сдаваться: срок держит закрытие по ctx выше.

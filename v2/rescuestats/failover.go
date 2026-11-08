@@ -18,10 +18,12 @@ import (
 )
 
 const (
-	FailoverInterval      = 5 * time.Second
-	FailoverTimeout       = 4 * time.Second
-	FailoverWindow        = 25 * time.Second
-	FailoverThreshold     = 4
+	FailoverInterval  = 5 * time.Second
+	FailoverTimeout   = 4 * time.Second
+	FailoverWindow    = 25 * time.Second
+	FailoverThreshold = 4
+	// Гарантия 35 с рассчитана на одну волну подтверждения.
+	FailoverMaxServers    = 8
 	FailoverCredit        = 25 * time.Second
 	failoverPause         = 15 * time.Second
 	failoverWallPause     = 10 * time.Second
@@ -123,6 +125,10 @@ func (m *failoverMachine) next() *failoverBatch {
 			}
 		}
 		if !found && !m.starting {
+			// Внешний выбор тоже подтверждаем в пределах одной волны.
+			if len(tags) >= FailoverMaxServers {
+				tags = tags[:FailoverMaxServers-1]
+			}
 			tags = append(tags, m.active)
 		}
 	}
@@ -209,20 +215,39 @@ func (m *failoverMachine) switchedTo(tag string, now time.Time) {
 
 // TCP и UDP используют общий deadline. Владелец собирает результат по сроку,
 // а эта горутина ждёт обе части, чтобы учитывать живых сирот до конца.
-func probeFailover(ctx context.Context, link string, d N.Dialer, tcp probeFunc, udp func(context.Context, N.Dialer) error) failoverResult {
+func probeFailover(ctx context.Context, link string, d N.Dialer, tcp probeFunc, udp func(context.Context, N.Dialer) error, logs ...func(string)) failoverResult {
+	var log func(string)
+	if len(logs) > 0 {
+		log = logs[0]
+	}
 	var delay time.Duration
 	var tcpErr, udpErr error
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); delay, tcpErr = tcp(ctx, link, d) }()
 	go func() {
 		defer wg.Done()
+		defer recoverFailoverPart("TCP", &tcpErr, log)
+		delay, tcpErr = tcp(ctx, link, d)
+	}()
+	go func() {
+		defer wg.Done()
+		defer recoverFailoverPart("UDP", &udpErr, log)
 		if udp != nil {
 			udpErr = udp(ctx, d)
 		}
 	}()
 	wg.Wait()
 	return failoverResult{OK: tcpErr == nil && udpErr == nil && ctx.Err() == nil, Delay: delay, Canceled: ctx.Err() == context.Canceled}
+}
+
+// Перехватываем панику только на границе рабочей горутины.
+func recoverFailoverPart(part string, err *error, log func(string)) {
+	if value := recover(); value != nil {
+		*err = fmt.Errorf("паника в пробе %s", part)
+		if log != nil {
+			log((*err).Error())
+		}
+	}
 }
 
 type failoverSelector interface {
@@ -277,7 +302,7 @@ func (f *Failover) Start(stage adapter.StartStage) error {
 		if !exists {
 			return failoverResult{Canceled: ctx.Err() == context.Canceled}
 		}
-		return probeFailover(ctx, link, dialer, urlTestProbe, failoverUDPCheck)
+		return probeFailover(ctx, link, dialer, urlTestProbe, failoverUDPCheck, f.opts.Log)
 	}
 	r := newFailoverRun(inst.Context(), f.opts, sel, servers, check, newRealTicker)
 	if r == nil {
@@ -438,6 +463,12 @@ func newFailoverRun(parent context.Context, opts FailoverOptions, sel failoverSe
 	if sel == nil || len(unique) < 2 {
 		return nil
 	}
+	if len(unique) > FailoverMaxServers {
+		unique = unique[:FailoverMaxServers]
+		if opts.Log != nil {
+			opts.Log("сторож: используются первые 8 выходов select")
+		}
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -450,16 +481,24 @@ func newFailoverRun(parent context.Context, opts FailoverOptions, sel failoverSe
 	return r
 }
 
-func runFailoverProbe(ctx context.Context, check failoverProbe, workers *failoverWorkers, work *failoverWork, generation uint64, replies chan<- failoverReply) {
+func runFailoverProbe(ctx context.Context, check failoverProbe, workers *failoverWorkers, work *failoverWork, generation uint64, replies chan<- failoverReply, logs ...func(string)) {
 	result := failoverResult{Canceled: ctx.Err() == context.Canceled}
+	defer func() {
+		if value := recover(); value != nil {
+			result = failoverResult{Canceled: ctx.Err() == context.Canceled}
+			if len(logs) > 0 && logs[0] != nil {
+				logs[0]("паника в пробе выхода " + work.tag)
+			}
+		}
+		// Сирота не задерживает остановку, даже если владелец уже ушёл.
+		select {
+		case replies <- failoverReply{generation, work.tag, result}:
+		default:
+		}
+	}()
+	defer workers.finish(work)
 	if ctx.Err() == nil {
 		result = check(ctx, work.tag)
-	}
-	workers.finish(work)
-	// Сирота не задерживает остановку, даже если владелец уже ушёл.
-	select {
-	case replies <- failoverReply{generation, work.tag, result}:
-	default:
 	}
 }
 
@@ -503,7 +542,7 @@ func (r *failoverRun) launchWave() {
 			r.replies <- failoverReply{generation: w.generation, tag: tag}
 			continue
 		}
-		go runFailoverProbe(w.ctx, r.check, r.workers, work, w.generation, r.replies)
+		go runFailoverProbe(w.ctx, r.check, r.workers, work, w.generation, r.replies, r.opts.Log)
 	}
 }
 
