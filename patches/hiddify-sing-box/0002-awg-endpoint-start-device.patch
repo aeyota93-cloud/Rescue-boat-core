@@ -1,0 +1,32 @@
+diff --git a/protocol/awg/endpoint.go b/protocol/awg/endpoint.go
+index 0e1a20994..59bb8458c 100644
+--- a/protocol/awg/endpoint.go
++++ b/protocol/awg/endpoint.go
+@@ -230,8 +230,10 @@ func (w *Endpoint) NewConnectionEx(ctx context.Context, conn net.Conn, source M.
+ }
+ 
+ func (o *Endpoint) Start(stage adapter.StartStage) error {
+-	if stage != adapter.StartStateStart {
+-		// return o.endpoint.Start(false)
++	// Шлюпка: устройство AmneziaWG поднимается здесь (Device.Start работает на StartStateStart);
++	// раньше этот вызов был закомментирован, и выход «awg» никогда не стартовал.
++	if err := o.Device.Start(stage); err != nil {
++		return err
+ 	}
+ 	if stage == adapter.StartStatePostStart {
+ 		go o.readyChecker()
+diff --git a/transport/awg/device.go b/transport/awg/device.go
+index 10b1c9810..9b707b704 100644
+--- a/transport/awg/device.go
++++ b/transport/awg/device.go
+@@ -87,7 +87,9 @@ func (d *Device) Start(stage adapter.StartStage) error {
+ }
+ 
+ func (d *Device) Close() error {
+-	d.awgDevice.Close()
++	if d.awgDevice != nil {
++		d.awgDevice.Close()
++	}
+ 	return nil
+ }
+ 
