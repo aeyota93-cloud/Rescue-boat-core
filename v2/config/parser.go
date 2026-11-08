@@ -63,6 +63,7 @@ func parseConfigContent(ctx context.Context, content []byte, debug bool, configO
 		fmt.Printf("Convert using json\n")
 		if tmpJsonObj, ok := tmpJsonResult.(map[string]interface{}); ok {
 			mergeRescueLinks(ctx, tmpJsonObj, configOpt)
+			mergeRescueEndpoints(tmpJsonObj)
 			if tmpJsonObj["outbounds"] == nil && tmpJsonObj["endpoints"] == nil {
 				jsonObj["outbounds"] = []interface{}{jsonObj}
 			} else {
