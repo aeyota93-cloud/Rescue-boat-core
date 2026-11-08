@@ -1,0 +1,70 @@
+diff --git a/protocol/awg/endpoint.go b/protocol/awg/endpoint.go
+--- a/protocol/awg/endpoint.go
++++ b/protocol/awg/endpoint.go
+@@ -17,9 +17,11 @@
+ 	"github.com/sagernet/sing-box/option"
+ 	"github.com/sagernet/sing-box/transport/awg"
+ 	"github.com/sagernet/sing/common/bufio"
++	E "github.com/sagernet/sing/common/exceptions"
+ 	"github.com/sagernet/sing/common/format"
+ 	M "github.com/sagernet/sing/common/metadata"
+ 	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
+ 
+ 	"go4.org/netipx"
+ )
+@@ -95,9 +97,10 @@
+ 		Device:  dev,
+ 		Adapter: endpoint.NewAdapterWithDialerOptions("awg", tag, []string{N.NetworkTCP, N.NetworkUDP}, options.DialerOptions),
+ 		address: options.Address,
+-		router:  router,
+-		logger:  logger,
+-		ctx:     ctx,
++		router:    router,
++		logger:    logger,
++		dnsRouter: service.FromContext[adapter.DNSRouter](ctx),
++		ctx:       ctx,
+ 	}, nil
+ }
+ 
+@@ -229,6 +232,40 @@
+ 	w.router.RouteConnectionEx(ctx, conn, metadata, onClose)
+ }
+ 
++// Шлюпка: сетевой стек AmneziaWG (netstack) без DNS-серверов, и домен в адресе ломал выход
++// («cannot marshal DNS message») — проверки по имени (urltest) всегда падали. Как у wireguard:
++// домен разрешаем DNS ядра, затем подключаемся по адресам.
++func (o *Endpoint) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	if destination.IsFqdn() {
++		if o.dnsRouter == nil {
++			return nil, E.New("awg: нет DNS для ", destination.Fqdn)
++		}
++		addresses, err := o.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
++		if err != nil {
++			return nil, err
++		}
++		return N.DialSerial(ctx, o.Device, network, destination, addresses)
++	} else if !destination.Addr.IsValid() {
++		return nil, E.New("invalid destination: ", destination)
++	}
++	return o.Device.DialContext(ctx, network, destination)
++}
++
++func (o *Endpoint) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	if destination.IsFqdn() {
++		if o.dnsRouter == nil {
++			return nil, E.New("awg: нет DNS для ", destination.Fqdn)
++		}
++		addresses, err := o.dnsRouter.Lookup(ctx, destination.Fqdn, adapter.DNSQueryOptions{})
++		if err != nil {
++			return nil, err
++		}
++		packetConn, _, err := N.ListenSerial(ctx, o.Device, destination, addresses)
++		return packetConn, err
++	}
++	return o.Device.ListenPacket(ctx, destination)
++}
++
+ func (o *Endpoint) Start(stage adapter.StartStage) error {
+ 	// Шлюпка: устройство AmneziaWG поднимается здесь (Device.Start работает на StartStateStart);
+ 	// раньше этот вызов был закомментирован, и выход «awg» никогда не стартовал.
