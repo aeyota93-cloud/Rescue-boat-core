@@ -3,6 +3,7 @@ package rescuestats
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"sync"
@@ -19,14 +20,14 @@ type udpTestPacket struct {
 }
 
 type udpTestConn struct {
-	packets        chan udpTestPacket
-	closed         chan struct{}
-	written        chan struct{}
-	once           sync.Once
-	deadline       time.Time
-	ignoreDeadline bool
-	noDeadline     bool // SetDeadline возвращает ошибку, как у пакетных соединений hysteria2/vless
-	respond        func(*dns.Msg, M.Socksaddr) []udpTestPacket
+	packets    chan udpTestPacket
+	closed     chan struct{}
+	written    chan struct{}
+	once       sync.Once
+	deadline   time.Time
+	noDeadline bool // SetDeadline возвращает ошибку, как у пакетных соединений hysteria2/vless
+	readErr    error
+	respond    func(*dns.Msg, M.Socksaddr) []udpTestPacket
 }
 
 func newUDPTestConn() *udpTestConn {
@@ -34,19 +35,19 @@ func newUDPTestConn() *udpTestConn {
 }
 
 func (c *udpTestConn) ReadFrom(b []byte) (int, net.Addr, error) {
-	var timer <-chan time.Time
-	if !c.ignoreDeadline {
-		t := time.NewTimer(time.Until(c.deadline))
-		defer t.Stop()
-		timer = t.C
+	select {
+	case p := <-c.packets:
+		return copy(b, p.data), p.source, nil
+	default:
+	}
+	if c.readErr != nil {
+		return 0, nil, c.readErr
 	}
 	select {
 	case p := <-c.packets:
 		return copy(b, p.data), p.source, nil
 	case <-c.closed:
 		return 0, nil, net.ErrClosed
-	case <-timer:
-		return 0, nil, os.ErrDeadlineExceeded
 	}
 }
 
@@ -83,6 +84,47 @@ func (c *udpTestConn) SetWriteDeadline(t time.Time) error { return c.SetDeadline
 
 type udpTestDialer struct {
 	conns map[M.Socksaddr]*udpTestConn
+}
+
+type udpBlockedDialer struct {
+	udpTestDialer
+	started chan struct{}
+	release chan struct{}
+}
+
+func (d udpBlockedDialer) ListenPacket(ctx context.Context, dst M.Socksaddr) (net.PacketConn, error) {
+	close(d.started)
+	<-d.release
+	return d.udpTestDialer.ListenPacket(ctx, dst)
+}
+
+func TestProbeUDPCanceledDuringListenClosesBeforeUse(t *testing.T) {
+	dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
+	conn := newUDPTestConn()
+	dialer := udpBlockedDialer{udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: conn}}, make(chan struct{}), make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan bool, 1)
+	go func() { done <- probeUDPTarget(ctx, dialer, dst, nil, nil) }()
+	<-dialer.started
+	cancel()
+	close(dialer.release)
+	if <-done {
+		t.Fatal("отменённая проба успешна")
+	}
+	select {
+	case <-conn.closed:
+	default:
+		t.Fatal("позднее соединение не закрыто")
+	}
+	if !conn.deadline.IsZero() {
+		t.Fatal("соединение использовано после отмены")
+	}
+	select {
+	case <-conn.written:
+		t.Fatal("данные отправлены после отмены")
+	default:
+	}
 }
 
 func (d udpTestDialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
@@ -133,6 +175,7 @@ func TestProbeUDPResponses(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
 			c := newUDPTestConn()
+			c.readErr = os.ErrDeadlineExceeded
 			c.respond = func(q *dns.Msg, dst M.Socksaddr) []udpTestPacket {
 				p := udpAnswer(q, dst, tc.mutate)
 				if tc.foreignSource {
@@ -147,9 +190,7 @@ func TestProbeUDPResponses(t *testing.T) {
 				}
 				return packets
 			}
-			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
-			defer cancel()
-			err := probeUDPTargets(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst})
+			err := probeUDPTargetsWithTimeout(context.Background(), udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}, udpTestTimeout)
 			if (err == nil) != tc.wantOK {
 				t.Fatalf("ошибка: %v, успех: %v", err, tc.wantOK)
 			}
@@ -166,52 +207,61 @@ func TestProbeUDPResponses(t *testing.T) {
 func TestProbeUDPDeadlineUnsupported(t *testing.T) {
 	dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
 	c := newUDPTestConn()
-	c.noDeadline, c.ignoreDeadline = true, true
+	c.noDeadline = true
 	c.respond = func(q *dns.Msg, dst M.Socksaddr) []udpTestPacket { return []udpTestPacket{udpAnswer(q, dst, nil)} }
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := probeUDPTargets(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}); err != nil {
+	if err := probeUDPTargetsWithTimeout(context.Background(), udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}, udpTestTimeout); err != nil {
 		t.Fatalf("без поддержки deadline: %v", err)
-	}
-	// И без ответа проба кончается по сроку, а не висит.
-	c2 := newUDPTestConn()
-	c2.noDeadline, c2.ignoreDeadline = true, true
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel2()
-	start := time.Now()
-	if err := probeUDPTargets(ctx2, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c2}}, []M.Socksaddr{dst}); err == nil {
-		t.Fatal("ожидалась ошибка")
-	}
-	if time.Since(start) > time.Second {
-		t.Fatal("проба зависла")
 	}
 }
 
+func udpTestTimeout(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	return &failoverTestDeadline{Context: ctx, deadline: newFailoverClock().now().Add(d), duration: d, cancel: cancel}, cancel
+}
+
 func TestProbeUDPTimeout(t *testing.T) {
-	dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
-	c := newUDPTestConn()
-	start := time.Now()
-	err := probeUDPTargets(context.Background(), udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst})
-	if err == nil {
-		t.Fatal("ожидалась ошибка")
-	}
-	if elapsed := time.Since(start); elapsed < ProbeUDPTimeout-100*time.Millisecond || elapsed > 4500*time.Millisecond {
-		t.Fatalf("тайм-аут: %v", elapsed)
+	for _, noDeadline := range []bool{false, true} {
+		t.Run(fmt.Sprint(noDeadline), func(t *testing.T) {
+			dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
+			c := newUDPTestConn()
+			c.noDeadline = noDeadline
+			timeouts := make(chan *failoverTestDeadline, 1)
+			timeout := func(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+				ctx, cancel := udpTestTimeout(parent, d)
+				timeouts <- ctx.(*failoverTestDeadline)
+				return ctx, cancel
+			}
+			done := make(chan error, 1)
+			go func() {
+				done <- probeUDPTargetsWithTimeout(context.Background(), udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}, timeout)
+			}()
+			deadline := <-timeouts
+			<-c.written
+			if deadline.duration != 4*time.Second {
+				t.Fatal("тайм-аут UDP", deadline.duration)
+			}
+			deadline.expire()
+			if err := <-done; err == nil {
+				t.Fatal("ожидалась ошибка")
+			}
+			select {
+			case <-c.closed:
+			default:
+				t.Fatal("соединение не закрыто по сроку")
+			}
+		})
 	}
 }
 
 func TestProbeUDPParallel(t *testing.T) {
 	first, second := M.ParseSocksaddrHostPort("1.1.1.1", 53), M.ParseSocksaddrHostPort("8.8.8.8", 53)
 	silent, good := newUDPTestConn(), newUDPTestConn()
-	silent.ignoreDeadline = true
 	good.respond = func(q *dns.Msg, dst M.Socksaddr) []udpTestPacket {
 		// Вторая цель отвечает, только когда первая уже ждёт ответа.
 		<-silent.written
 		return []udpTestPacket{udpAnswer(q, dst, nil)}
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
-	defer cancel()
-	if err := ProbeUDP(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{first: silent, second: good}}); err != nil {
+	if err := probeUDPTargetsWithTimeout(context.Background(), udpTestDialer{map[M.Socksaddr]*udpTestConn{first: silent, second: good}}, []M.Socksaddr{first, second}, udpTestTimeout); err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range []*udpTestConn{silent, good} {
@@ -226,26 +276,16 @@ func TestProbeUDPParallel(t *testing.T) {
 func TestProbeUDPCancel(t *testing.T) {
 	dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
 	c := newUDPTestConn()
-	c.ignoreDeadline = true
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
 	go func() {
-		result <- probeUDPTargets(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst})
+		result <- probeUDPTargetsWithTimeout(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}, udpTestTimeout)
 	}()
-	select {
-	case <-c.written:
-	case <-time.After(time.Second):
-		t.Fatal("запрос не отправлен")
-	}
+	<-c.written
 	cancel()
-	select {
-	case err := <-result:
-		if err != ctx.Err() {
-			t.Fatalf("получено %v, ожидалось %v", err, ctx.Err())
-		}
-	case <-time.After(time.Second):
-		t.Fatal("отмена не прервала чтение")
+	if err := <-result; err != ctx.Err() {
+		t.Fatalf("получено %v, ожидалось %v", err, ctx.Err())
 	}
 	select {
 	case <-c.closed:

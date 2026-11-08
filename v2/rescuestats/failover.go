@@ -7,6 +7,8 @@ package rescuestats
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,18 +18,21 @@ import (
 )
 
 const (
-	FailoverInterval   = 5 * time.Second
-	FailoverTimeout    = 4 * time.Second
-	FailoverWindow     = 25 * time.Second
-	FailoverThreshold  = 4
-	FailoverCredit     = 25 * time.Second
-	failoverPause      = 15 * time.Second
-	failoverWallPause  = 10 * time.Second
-	failoverEqualDelay = 5 * time.Millisecond
-	failoverParallel   = 8
-	KindFailover       = "failover"
-	FailoverMsgStart   = "выбран самый быстрый рабочий"
-	FailoverMsgBroken  = "сервер не отвечает 25 с"
+	FailoverInterval      = 5 * time.Second
+	FailoverTimeout       = 4 * time.Second
+	FailoverWindow        = 25 * time.Second
+	FailoverThreshold     = 4
+	FailoverCredit        = 25 * time.Second
+	failoverPause         = 15 * time.Second
+	failoverWallPause     = 10 * time.Second
+	failoverEqualDelay    = 5 * time.Millisecond
+	failoverParallel      = 8
+	failoverStartParallel = 4
+	failoverOrphanLimit   = 2
+	failoverStopTimeout   = time.Second
+	KindFailover          = "failover"
+	FailoverMsgStart      = "выбран самый быстрый рабочий"
+	FailoverMsgBroken     = "сервер не отвечает 25 с"
 )
 
 // UDP-часть пробы сервера (DNS через выход, probe_udp.go); тесты подменяют.
@@ -202,10 +207,9 @@ func (m *failoverMachine) switchedTo(tag string, now time.Time) {
 	m.active, m.starting, m.switched = tag, false, now
 }
 
-// TCP и UDP используют общий deadline; отмена владельцем не считается отказом.
+// TCP и UDP используют общий deadline. Владелец собирает результат по сроку,
+// а эта горутина ждёт обе части, чтобы учитывать живых сирот до конца.
 func probeFailover(ctx context.Context, link string, d N.Dialer, tcp probeFunc, udp func(context.Context, N.Dialer) error) failoverResult {
-	ctx, cancel := context.WithTimeout(ctx, FailoverTimeout)
-	defer cancel()
 	var delay time.Duration
 	var tcpErr, udpErr error
 	var wg sync.WaitGroup
@@ -275,7 +279,7 @@ func (f *Failover) Start(stage adapter.StartStage) error {
 		}
 		return probeFailover(ctx, link, dialer, urlTestProbe, failoverUDPCheck)
 	}
-	r := newFailoverRun(f.opts, sel, servers, check, newRealTicker)
+	r := newFailoverRun(inst.Context(), f.opts, sel, servers, check, newRealTicker)
 	if r == nil {
 		return nil
 	}
@@ -289,7 +293,7 @@ func (f *Failover) Start(stage adapter.StartStage) error {
 	return nil
 }
 
-// Close ждёт цикл и все рабочие горутины. Повторный вызов безопасен.
+// Close ждёт цикл, затем даёт сиротам до секунды. Повторный вызов безопасен.
 func (f *Failover) Close() error {
 	f.access.Lock()
 	defer f.access.Unlock()
@@ -332,23 +336,97 @@ func newRealTicker(d time.Duration) (<-chan time.Time, func()) {
 }
 
 type failoverRun struct {
-	opts        FailoverOptions
-	sel         failoverSelector
-	servers     []string
-	check       failoverProbe
-	ticker      failoverTicker
-	store       *Store
-	machine     *failoverMachine
-	processed   func() // Тесты: событие обработано владельцем.
-	ctx         context.Context
-	cancel      context.CancelFunc
-	wg, workers sync.WaitGroup
-	once        sync.Once
-	slots       chan struct{}
-	replies     chan failoverReply
+	opts      FailoverOptions
+	sel       failoverSelector
+	servers   []string
+	check     failoverProbe
+	ticker    failoverTicker
+	store     *Store
+	machine   *failoverMachine
+	processed func() // Тесты: событие обработано владельцем.
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	once      sync.Once
+	replies   chan failoverReply
+	timeout   func(context.Context, time.Duration) (context.Context, context.CancelFunc)
+	workers   *failoverWorkers
+	wave      *failoverWave
 }
 
-func newFailoverRun(opts FailoverOptions, sel failoverSelector, servers []string, check failoverProbe, ticker failoverTicker) *failoverRun {
+// Реестр живёт отдельно от машины. Рабочие горутины знают только его и свой результат.
+type failoverWork struct {
+	tag    string
+	orphan bool
+}
+
+type failoverWorkers struct {
+	mu      sync.Mutex
+	live    map[*failoverWork]struct{}
+	orphans map[string]int
+	idle    chan struct{}
+}
+
+func newFailoverWorkers() *failoverWorkers {
+	idle := make(chan struct{})
+	close(idle)
+	return &failoverWorkers{live: make(map[*failoverWork]struct{}), orphans: make(map[string]int), idle: idle}
+}
+
+func (w *failoverWorkers) begin(tag string) *failoverWork {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.orphans[tag] >= failoverOrphanLimit {
+		return nil
+	}
+	if len(w.live) == 0 {
+		w.idle = make(chan struct{})
+	}
+	work := &failoverWork{tag: tag}
+	w.live[work] = struct{}{}
+	return work
+}
+
+func (w *failoverWorkers) finish(work *failoverWork) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	delete(w.live, work)
+	if work.orphan {
+		w.orphans[work.tag]--
+		if w.orphans[work.tag] == 0 {
+			delete(w.orphans, work.tag)
+		}
+	}
+	if len(w.live) == 0 {
+		close(w.idle)
+	}
+}
+
+func (w *failoverWorkers) detach(work *failoverWork) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if _, alive := w.live[work]; alive && !work.orphan {
+		work.orphan = true
+		w.orphans[work.tag]++
+	}
+}
+
+func (w *failoverWorkers) waiting() (<-chan struct{}, int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.idle, len(w.live)
+}
+
+type failoverWave struct {
+	ctx        context.Context
+	cancel     context.CancelFunc
+	generation uint64
+	pending    map[string]*failoverWork
+	queue      []string
+	limit      int
+}
+
+func newFailoverRun(parent context.Context, opts FailoverOptions, sel failoverSelector, servers []string, check failoverProbe, ticker failoverTicker) *failoverRun {
 	seen := make(map[string]bool)
 	var unique []string
 	for _, tag := range servers {
@@ -364,39 +442,140 @@ func newFailoverRun(opts FailoverOptions, sel failoverSelector, servers []string
 		opts.Now = time.Now
 	}
 	r := &failoverRun{opts: opts, sel: sel, servers: unique, check: check, ticker: ticker,
-		slots: make(chan struct{}, failoverParallel), replies: make(chan failoverReply)}
+		timeout: context.WithTimeout, workers: newFailoverWorkers(), replies: make(chan failoverReply, 4*len(unique)+8)}
 	if opts.StatsDir != "" {
 		r.store = NewStore(opts.StatsDir, opts.Now)
 	}
-	r.ctx, r.cancel = context.WithCancel(context.Background())
+	r.ctx, r.cancel = context.WithCancel(parent)
 	return r
 }
 
-func (r *failoverRun) launch(b *failoverBatch) context.CancelFunc {
-	ctx, cancel := context.WithTimeout(r.ctx, FailoverTimeout)
-	for _, tag := range b.tags {
-		r.workers.Add(1)
-		go func(tag string) {
-			defer r.workers.Done()
-			result := failoverResult{Canceled: true}
-			select {
-			case r.slots <- struct{}{}:
-				if ctx.Err() == nil {
-					result = r.check(ctx, tag)
-				} else {
-					result.Canceled = ctx.Err() == context.Canceled
-				}
-				<-r.slots
-			case <-ctx.Done():
-				result.Canceled = ctx.Err() == context.Canceled
-			}
-			select {
-			case r.replies <- failoverReply{generation: b.generation, tag: tag, result: result}:
-			case <-r.ctx.Done():
-			}
-		}(tag)
+func runFailoverProbe(ctx context.Context, check failoverProbe, workers *failoverWorkers, work *failoverWork, generation uint64, replies chan<- failoverReply) {
+	result := failoverResult{Canceled: ctx.Err() == context.Canceled}
+	if ctx.Err() == nil {
+		result = check(ctx, work.tag)
 	}
-	return cancel
+	workers.finish(work)
+	// Сирота не задерживает остановку, даже если владелец уже ушёл.
+	select {
+	case replies <- failoverReply{generation, work.tag, result}:
+	default:
+	}
+}
+
+func (r *failoverRun) launch(b *failoverBatch) {
+	if b == nil || r.ctx.Err() != nil {
+		return
+	}
+	limit := failoverParallel
+	if r.machine.starting {
+		limit = failoverStartParallel
+	}
+	r.wave = &failoverWave{generation: b.generation, queue: b.tags, limit: limit}
+	r.launchWave()
+}
+
+func (r *failoverRun) launchWave() {
+	w := r.wave
+	if w == nil {
+		return
+	}
+	if r.ctx.Err() != nil {
+		r.cancelWave()
+		return
+	}
+	if len(w.queue) == 0 {
+		r.wave = nil
+		return
+	}
+	n := min(w.limit, len(w.queue))
+	tags := w.queue[:n]
+	w.queue = w.queue[n:]
+	w.ctx, w.cancel = r.timeout(r.ctx, FailoverTimeout)
+	w.pending = make(map[string]*failoverWork, n)
+	for _, tag := range tags {
+		if r.ctx.Err() != nil {
+			return
+		}
+		work := r.workers.begin(tag)
+		w.pending[tag] = work
+		if work == nil {
+			r.replies <- failoverReply{generation: w.generation, tag: tag}
+			continue
+		}
+		go runFailoverProbe(w.ctx, r.check, r.workers, work, w.generation, r.replies)
+	}
+}
+
+func (r *failoverRun) cancelWave() {
+	if w := r.wave; w != nil {
+		if w.cancel != nil {
+			w.cancel()
+		}
+		for _, work := range w.pending {
+			if work != nil {
+				r.workers.detach(work)
+			}
+		}
+		r.wave = nil
+	}
+}
+
+func (r *failoverRun) receive(reply failoverReply) {
+	if r.ctx.Err() != nil {
+		return
+	}
+	b := r.machine.pending
+	starting := r.machine.starting
+	now := r.opts.Now()
+	if r.ctx.Err() != nil {
+		return
+	}
+	decision, follow := r.machine.receive(now, reply)
+	r.apply(decision)
+	if b != nil && reply.generation == b.generation && len(b.results) == len(b.tags) && starting {
+		r.logStartup(b)
+	}
+	if follow {
+		r.cancelWave()
+		r.launch(r.machine.next())
+	}
+}
+
+func (r *failoverRun) logStartup(b *failoverBatch) {
+	if r.opts.Log == nil || r.ctx.Err() != nil {
+		return
+	}
+	var parts []string
+	for _, tag := range b.tags {
+		result := b.results[tag]
+		status := "неудача"
+		if result.OK && !result.Canceled {
+			status = "ok"
+		}
+		parts = append(parts, fmt.Sprintf("%s: %s, %d мс", tag, status, result.Delay.Milliseconds()))
+	}
+	selected := r.sel.Now()
+	if r.ctx.Err() == nil {
+		r.opts.Log("стартовая проверка: " + strings.Join(parts, "; ") + "; выбран: " + selected)
+	}
+}
+
+func (r *failoverRun) expireWave() {
+	w := r.wave
+	if w == nil || r.ctx.Err() != nil {
+		return
+	}
+	w.cancel()
+	for tag, work := range w.pending {
+		if work != nil {
+			r.workers.detach(work)
+		}
+		r.receive(failoverReply{w.generation, tag, failoverResult{Delay: FailoverTimeout}})
+	}
+	if r.wave == w {
+		r.launchWave()
+	}
 }
 
 func (r *failoverRun) start() {
@@ -405,8 +584,11 @@ func (r *failoverRun) start() {
 	r.wg.Add(1)
 	go func() {
 		defer r.wg.Done()
-		defer r.workers.Wait()
 		defer stopTicker()
+		defer r.cancelWave()
+		if r.ctx.Err() != nil {
+			return
+		}
 		now := r.opts.Now()
 		r.machine = newFailoverMachine(r.servers, initial, now)
 		if selected := r.sel.Now(); selected != initial {
@@ -418,20 +600,40 @@ func (r *failoverRun) start() {
 				r.machine.active = r.servers[0]
 			}
 		}
-		cancelBatch := r.launch(r.machine.next())
-		defer func() { cancelBatch() }()
+		r.launch(r.machine.next())
 		for {
+			if r.ctx.Err() != nil {
+				return
+			}
+			var deadline <-chan struct{}
+			if r.wave != nil {
+				deadline = r.wave.ctx.Done()
+			}
 			select {
 			case <-r.ctx.Done():
 				return
 			case <-c:
+				if r.ctx.Err() != nil {
+					return
+				}
 				now := r.opts.Now()
 				if r.machine.observe(now, r.sel.Now(), true) {
-					cancelBatch()
+					r.cancelWave()
+				} else if r.wave != nil && r.wave.ctx.Err() != nil {
+					r.expireWave()
 				}
 				if b := r.machine.next(); b != nil {
-					cancelBatch()
-					cancelBatch = r.launch(b)
+					r.launch(b)
+				}
+			case <-deadline:
+				if r.ctx.Err() != nil {
+					return
+				}
+				if r.machine.observe(r.opts.Now(), r.sel.Now(), false) {
+					r.cancelWave()
+					r.launch(r.machine.next())
+				} else {
+					r.expireWave()
 				}
 			case reply := <-r.replies:
 				if r.ctx.Err() != nil {
@@ -439,14 +641,20 @@ func (r *failoverRun) start() {
 				}
 				now := r.opts.Now()
 				if r.machine.observe(now, r.sel.Now(), false) {
-					cancelBatch()
-					cancelBatch = r.launch(r.machine.next())
+					r.cancelWave()
+					r.launch(r.machine.next())
 				}
-				decision, follow := r.machine.receive(now, reply)
-				r.apply(decision)
-				if follow {
-					cancelBatch()
-					cancelBatch = r.launch(r.machine.next())
+				if r.wave != nil && r.wave.ctx.Err() != nil {
+					r.expireWave()
+				}
+				w := r.wave
+				r.receive(reply)
+				if w != nil && r.wave == w && reply.generation == w.generation {
+					delete(w.pending, reply.tag)
+					if len(w.pending) == 0 {
+						w.cancel()
+						r.launchWave()
+					}
 				}
 			}
 			if r.processed != nil {
@@ -460,6 +668,19 @@ func (r *failoverRun) stop() {
 	r.once.Do(func() {
 		r.cancel()
 		r.wg.Wait()
+		idle, count := r.workers.waiting()
+		if count > 0 {
+			ctx, cancel := r.timeout(context.Background(), failoverStopTimeout)
+			select {
+			case <-idle:
+			case <-ctx.Done():
+			}
+			cancel()
+			_, count = r.workers.waiting()
+		}
+		if r.opts.Log != nil {
+			r.opts.Log(fmt.Sprintf("сторож остановлен: осталось сирот — %d", count))
+		}
 		if r.store != nil {
 			r.store.Close()
 		}
@@ -474,6 +695,9 @@ func (r *failoverRun) apply(d failoverDecision) {
 		r.machine.observe(r.opts.Now(), selected, false)
 		return
 	}
+	if r.ctx.Err() != nil {
+		return
+	}
 	// Между Now и Swap остаётся гонка с clash API: условного выбора в sing-box нет,
 	// подмодуль не меняем. Приложение после ручного выбора выключает авто; внешний
 	// выбор принимается на следующем событии. Окно — микросекунды: возможен выбор
@@ -481,12 +705,18 @@ func (r *failoverRun) apply(d failoverDecision) {
 	if !r.sel.SelectOutbound(d.To) {
 		return
 	}
+	if r.ctx.Err() != nil {
+		return
+	}
 	now := r.opts.Now()
+	if r.ctx.Err() != nil {
+		return
+	}
 	r.machine.switchedTo(d.To, now)
 	if r.opts.Log != nil {
 		r.opts.Log("автопереключение: " + d.Msg + " → " + d.To)
 	}
-	if r.store != nil {
+	if r.store != nil && r.ctx.Err() == nil {
 		r.store.AddError(ErrorRecord{T: now.UnixMilli(), Kind: KindFailover, Host: d.To, Route: RouteVPN, Msg: d.Msg})
 		r.store.Flush(true)
 	}

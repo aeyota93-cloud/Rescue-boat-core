@@ -25,7 +25,11 @@ func ProbeUDP(ctx context.Context, dialer N.Dialer) error {
 }
 
 func probeUDPTargets(ctx context.Context, dialer N.Dialer, targets []M.Socksaddr) error {
-	probeCtx, cancel := context.WithTimeout(ctx, ProbeUDPTimeout)
+	return probeUDPTargetsWithTimeout(ctx, dialer, targets, context.WithTimeout)
+}
+
+func probeUDPTargetsWithTimeout(ctx context.Context, dialer N.Dialer, targets []M.Socksaddr, timeout func(context.Context, time.Duration) (context.Context, context.CancelFunc)) error {
+	probeCtx, cancel := timeout(ctx, ProbeUDPTimeout)
 	defer cancel()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -71,6 +75,10 @@ func probeUDPTargets(ctx context.Context, dialer N.Dialer, targets []M.Socksaddr
 func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query *dns.Msg, wire []byte) bool {
 	pc, err := dialer.ListenPacket(ctx, dst)
 	if err != nil {
+		return false
+	}
+	if ctx.Err() != nil {
+		pc.Close()
 		return false
 	}
 	// Закрытие прерывает чтение даже у обёрток без поддержки deadline.

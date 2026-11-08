@@ -254,6 +254,24 @@ type probeCall struct {
 	tag   string
 	reply chan failoverResult
 }
+
+type failoverTestDeadline struct {
+	context.Context
+	deadline time.Time
+	duration time.Duration
+	expired  atomic.Bool
+	cancel   context.CancelFunc
+}
+
+func (c *failoverTestDeadline) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *failoverTestDeadline) Err() error {
+	if c.expired.Load() {
+		return context.DeadlineExceeded
+	}
+	return c.Context.Err()
+}
+func (c *failoverTestDeadline) expire() { c.expired.Store(true); c.cancel() }
+
 type machineSnapshot struct {
 	active                       string
 	starting, searching, pending bool
@@ -261,22 +279,29 @@ type machineSnapshot struct {
 	generation                   uint64
 }
 type failoverHarness struct {
-	t       *testing.T
-	clock   *failoverClock
-	sel     *fakeSelector
-	r       *failoverRun
-	ticks   chan time.Time
-	calls   chan probeCall
-	events  chan machineSnapshot
-	state   machineSnapshot
-	stopped chan struct{}
-	live    atomic.Int32
+	t        *testing.T
+	clock    *failoverClock
+	sel      *fakeSelector
+	r        *failoverRun
+	ticks    chan time.Time
+	calls    chan probeCall
+	events   chan machineSnapshot
+	state    machineSnapshot
+	stopped  chan struct{}
+	live     atomic.Int32
+	timeouts chan *failoverTestDeadline
+	logs     chan string
 }
 
 func newFailoverHarness(t *testing.T, tags []string, dir string, ignoreCancel bool, initial ...string) *failoverHarness {
+	return newFailoverHarnessWithParent(t, context.Background(), tags, dir, ignoreCancel, initial...)
+}
+
+func newFailoverHarnessWithParent(t *testing.T, parent context.Context, tags []string, dir string, ignoreCancel bool, initial ...string) *failoverHarness {
 	t.Helper()
 	h := &failoverHarness{t: t, clock: newFailoverClock(), sel: &fakeSelector{now: tags[0]}, ticks: make(chan time.Time),
-		calls: make(chan probeCall, 100), events: make(chan machineSnapshot, 100), stopped: make(chan struct{})}
+		calls: make(chan probeCall, 100), events: make(chan machineSnapshot, 100), stopped: make(chan struct{}),
+		timeouts: make(chan *failoverTestDeadline, 1000), logs: make(chan string, 1000)}
 	if len(initial) > 0 {
 		h.sel.now = initial[0]
 	}
@@ -295,13 +320,19 @@ func newFailoverHarness(t *testing.T, tags []string, dir string, ignoreCancel bo
 			return failoverResult{Canceled: ctx.Err() == context.Canceled}
 		}
 	}
-	h.r = newFailoverRun(FailoverOptions{StatsDir: dir, Now: h.clock.now}, h.sel, tags, check,
+	h.r = newFailoverRun(parent, FailoverOptions{StatsDir: dir, Now: h.clock.now, Log: func(msg string) { h.logs <- msg }}, h.sel, tags, check,
 		func(d time.Duration) (<-chan time.Time, func()) {
 			if d != 5*time.Second {
 				t.Errorf("interval %v", d)
 			}
 			return h.ticks, func() { close(h.stopped) }
 		})
+	h.r.timeout = func(parent context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+		ctx, cancel := context.WithCancel(parent)
+		deadline := &failoverTestDeadline{Context: ctx, deadline: h.clock.now().Add(d), duration: d, cancel: cancel}
+		h.timeouts <- deadline
+		return deadline, cancel
+	}
 	h.r.processed = func() {
 		m := h.r.machine
 		h.events <- machineSnapshot{m.active, m.starting, m.searching, m.pending != nil, m.failures, m.generation}
@@ -579,7 +610,7 @@ func TestFailoverEventsOnlyOnSuccessfulChange(t *testing.T) {
 func TestFailoverApplyChecksSelectorAgain(t *testing.T) {
 	now := newFailoverClock().now()
 	sel := &fakeSelector{now: "A"}
-	r := newFailoverRun(FailoverOptions{Now: func() time.Time { return now }}, sel, []string{"A", "B", "C"}, nil, nil)
+	r := newFailoverRun(context.Background(), FailoverOptions{Now: func() time.Time { return now }}, sel, []string{"A", "B", "C"}, nil, nil)
 	r.machine = newFailoverMachine(r.servers, "A", now)
 	sel.beforeNow = func() { sel.now = "C" }
 	r.apply(failoverDecision{From: "A", To: "B", Msg: FailoverMsgStart})
@@ -632,19 +663,326 @@ func TestFailoverConcurrencyLimitAndDuplicates(t *testing.T) {
 	}
 	tags = append(tags, "0", "1")
 	h := newFailoverHarness(t, tags, "", false)
-	first := h.collect(8)
-	if h.live.Load() != 8 {
-		t.Fatal("not eight concurrent probes", h.live.Load())
+	first := h.collect(4)
+	if h.live.Load() != 4 {
+		t.Fatal("not four concurrent startup probes", h.live.Load())
 	}
 	select {
 	case call := <-h.calls:
-		t.Fatal("more than eight concurrent probes", call.tag)
+		t.Fatal("more than four concurrent startup probes", call.tag)
 	default:
 	}
 	h.finish(first, nil)
 	h.finish(h.collect(4), nil)
+	h.finish(h.collect(4), nil)
 	if !h.state.starting {
 		t.Fatal("startup ended without working server")
+	}
+}
+
+func (h *failoverHarness) expire(calls map[string]probeCall) {
+	h.t.Helper()
+	for _, call := range calls {
+		deadline := call.ctx.(*failoverTestDeadline)
+		if deadline.duration != FailoverTimeout {
+			h.t.Fatalf("probe timeout %v", deadline.duration)
+		}
+		h.clock.advance(FailoverTimeout, FailoverTimeout)
+		deadline.expire()
+		h.processed(1)
+		return
+	}
+	h.t.Fatal("no calls to expire")
+}
+
+func (h *failoverHarness) orphanCount(tag string) int {
+	h.r.workers.mu.Lock()
+	defer h.r.workers.mu.Unlock()
+	return h.r.workers.orphans[tag]
+}
+
+func (h *failoverHarness) noErrorEvents(dir string) {
+	h.t.Helper()
+	if files, err := filepath.Glob(filepath.Join(dir, "errors-*.jsonl")); err != nil || len(files) != 0 {
+		h.t.Fatalf("unexpected events: %v, %v", files, err)
+	}
+}
+
+func TestFailoverDeadlineOrphansAndLimit(t *testing.T) {
+	h := newFailoverHarness(t, []string{"A", "B"}, "", true)
+	first := h.collect(2)
+	h.expire(first)
+	if h.state.pending || !h.state.starting {
+		t.Fatal("deadline did not finish failed startup batch", h.state)
+	}
+	for _, tag := range []string{"A", "B"} {
+		if h.orphanCount(tag) != 1 || first[tag].ctx.Err() == nil {
+			t.Fatal("orphan not counted or not canceled", tag)
+		}
+	}
+	h.tick(time.Second, time.Second)
+	second := h.collect(2)
+	h.expire(second)
+	for _, tag := range []string{"A", "B"} {
+		if h.orphanCount(tag) != 2 {
+			t.Fatal("second orphan not counted", tag)
+		}
+	}
+	h.tick(time.Second, time.Second)
+	// При двух сиротах результаты неудачи приходят сразу, без новых вызовов.
+	h.processed(2)
+	if h.state.pending || !h.state.starting || h.live.Load() != 4 {
+		t.Fatal("orphan limit did not finish batch immediately", h.state, h.live.Load())
+	}
+	select {
+	case call := <-h.calls:
+		t.Fatal("probe started above orphan limit", call.tag)
+	default:
+	}
+	for _, calls := range []map[string]probeCall{first, second} {
+		h.finish(calls, nil)
+	}
+	for _, tag := range []string{"A", "B"} {
+		if h.orphanCount(tag) != 0 {
+			t.Fatal("orphan counter leaked", tag)
+		}
+	}
+	h.tick(5*time.Second, 5*time.Second)
+	h.finish(h.collect(2), map[string]failoverResult{"A": working(10)})
+	if h.state.starting {
+		t.Fatal("probes did not resume after orphans exited")
+	}
+}
+
+func TestFailoverOrphanLimitIsPerTag(t *testing.T) {
+	h := newFailoverHarness(t, []string{"A", "B"}, "", true)
+	var orphans []probeCall
+	for i := 0; i < 2; i++ {
+		calls := h.collect(2)
+		h.finish(map[string]probeCall{"B": calls["B"]}, nil)
+		h.expire(map[string]probeCall{"A": calls["A"]})
+		orphans = append(orphans, calls["A"])
+		h.tick(time.Second, time.Second)
+	}
+	h.processed(1)
+	current := h.collect(1)
+	if _, ok := current["B"]; !ok || h.live.Load() != 3 {
+		t.Fatal("orphan limit affected another tag", current)
+	}
+	h.finish(current, map[string]failoverResult{"B": working(20)})
+	if !slices.Equal(h.sel.history(), []string{"B"}) {
+		t.Fatal("healthy tag was not selected", h.sel.history())
+	}
+	for _, call := range orphans {
+		h.finish(map[string]probeCall{"A": call}, map[string]failoverResult{"A": working(1)})
+	}
+	if !slices.Equal(h.sel.history(), []string{"B"}) || h.orphanCount("A") != 0 {
+		t.Fatal("late orphan changed selection or leaked")
+	}
+}
+
+func TestFailoverDeadlineCountsAsFailureAndLateSuccessIsIgnored(t *testing.T) {
+	dir := t.TempDir()
+	h := newFailoverHarness(t, []string{"A", "B"}, dir, true)
+	h.finish(h.collect(2), map[string]failoverResult{"A": working(10)})
+	h.tick(5*time.Second, 5*time.Second)
+	late := h.collect(1)
+	h.expire(late)
+	if h.state.pending || h.state.failures != 1 {
+		t.Fatal("timeout was treated as cancellation", h.state)
+	}
+	h.tick(time.Second, time.Second)
+	current := h.collect(1)
+	h.finish(late, map[string]failoverResult{"A": working(1)})
+	if h.state.failures != 1 || !h.state.pending || h.orphanCount("A") != 0 {
+		t.Fatal("late success changed current batch", h.state)
+	}
+	h.finish(current, nil)
+	h.noSelection()
+	h.r.stop()
+	h.noErrorEvents(dir)
+}
+
+func TestFailoverLateStartupOrphanCannotSelectOrLogEvent(t *testing.T) {
+	dir := t.TempDir()
+	h := newFailoverHarness(t, []string{"A", "B"}, dir, true)
+	late := h.collect(2)
+	h.expire(late)
+	h.tick(time.Second, time.Second)
+	current := h.collect(2)
+	h.finish(late, map[string]failoverResult{"B": working(1)})
+	h.noSelection()
+	if !h.state.pending || !h.state.starting {
+		t.Fatal("late startup result accepted", h.state)
+	}
+	h.finish(current, map[string]failoverResult{"A": working(10)})
+	h.r.stop()
+	h.noErrorEvents(dir)
+}
+
+func TestFailoverCloseBoundsOrphanWait(t *testing.T) {
+	h := newFailoverHarness(t, []string{"A", "B"}, "", true)
+	calls := h.collect(2)
+	f := NewFailover(FailoverOptions{})
+	f.active = h.r
+	closed := make(chan struct{})
+	go func() { _ = f.Close(); close(closed) }()
+	for _, call := range calls {
+		<-call.ctx.Done()
+	}
+	var wait *failoverTestDeadline
+	for wait == nil {
+		deadline := <-h.timeouts
+		if deadline.duration == failoverStopTimeout {
+			wait = deadline
+		}
+	}
+	if wait.duration > time.Second {
+		t.Fatal("shutdown wait exceeds one second", wait.duration)
+	}
+	select {
+	case <-closed:
+		t.Fatal("Close did not give orphans time to finish")
+	default:
+	}
+	wait.expire()
+	<-closed
+	if f.Running() || h.live.Load() != 2 || h.orphanCount("A") != 1 || h.orphanCount("B") != 1 {
+		t.Fatal("Close waited for blocked probes or lost their accounting")
+	}
+	if msg := <-h.logs; !strings.Contains(msg, "осталось сирот — 2") {
+		t.Fatal("missing orphan diagnostic", msg)
+	}
+	// Даже после ухода владельца сироты завершаются без блокировки отправки.
+	idle, _ := h.r.workers.waiting()
+	for _, call := range calls {
+		call.reply <- working(1)
+	}
+	<-idle
+	if h.orphanCount("A") != 0 || h.orphanCount("B") != 0 {
+		t.Fatal("shutdown orphan counter leaked")
+	}
+	_ = f.Close()
+}
+
+func TestFailoverParentCancellationRejectsInflightSuccess(t *testing.T) {
+	dir := t.TempDir()
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := newFailoverHarnessWithParent(t, parent, []string{"A", "B"}, dir, true)
+	calls := h.collect(2)
+	cancel()
+	for _, call := range calls {
+		<-call.ctx.Done()
+	}
+	<-h.stopped
+	idle, _ := h.r.workers.waiting()
+	for _, call := range calls {
+		call.reply <- working(1)
+	}
+	<-idle
+	h.r.stop()
+	h.noSelection()
+	h.noErrorEvents(dir)
+	select {
+	case call := <-h.calls:
+		t.Fatal("probe started after parent cancellation", call.tag)
+	default:
+	}
+	if !h.r.machine.starting || h.r.machine.failures != 0 {
+		t.Fatal("parent cancellation changed decisions")
+	}
+	select {
+	case msg := <-h.logs:
+		if msg != "сторож остановлен: осталось сирот — 0" {
+			t.Fatal("startup result logged after cancellation", msg)
+		}
+	default:
+	}
+}
+
+func TestFailoverCanceledParentDoesNotStart(t *testing.T) {
+	parent, cancel := context.WithCancel(context.Background())
+	cancel()
+	h := newFailoverHarnessWithParent(t, parent, []string{"A", "B"}, "", false, "balance")
+	<-h.stopped
+	h.r.stop()
+	h.noSelection()
+	if len(h.calls) != 0 {
+		t.Fatal("probe started with canceled parent")
+	}
+}
+
+func TestFailoverStartupWavesHaveFullDeadlines(t *testing.T) {
+	tags := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	h := newFailoverHarness(t, tags, "", true)
+	start := h.clock.now()
+	var batches []map[string]probeCall
+	for _, size := range []int{4, 4, 1} {
+		calls := h.collect(size)
+		for _, call := range calls {
+			deadline, _ := call.ctx.Deadline()
+			if deadline.Sub(h.clock.now()) != FailoverTimeout {
+				t.Fatal("queued probe lost its full deadline", call.tag)
+			}
+		}
+		select {
+		case call := <-h.calls:
+			t.Fatal("more than four startup probes", call.tag)
+		default:
+		}
+		batches = append(batches, calls)
+		h.expire(calls)
+	}
+	if h.state.pending || h.clock.now().Sub(start) != 3*FailoverTimeout {
+		t.Fatal("wrong total startup deadline", h.state)
+	}
+	for _, calls := range batches {
+		h.finish(calls, nil)
+	}
+	h.noSelection()
+}
+
+func TestFailoverBrokenParallelLimit(t *testing.T) {
+	tags := []string{"A", "B", "C", "D", "E", "F", "G", "H", "I"}
+	h := newFailoverHarness(t, tags, "", false)
+	h.finish(h.collect(4), map[string]failoverResult{"A": working(10)})
+	h.finish(h.collect(4), nil)
+	h.finish(h.collect(1), nil)
+	for i := 0; i < 5; i++ {
+		h.monitor(failoverResult{})
+	}
+	first := h.collect(8)
+	if h.live.Load() != 8 || !h.state.searching {
+		t.Fatal("broken batch did not start eight probes", h.live.Load(), h.state)
+	}
+	select {
+	case call := <-h.calls:
+		t.Fatal("more than eight broken probes", call.tag)
+	default:
+	}
+	h.finish(first, nil)
+	h.finish(h.collect(1), map[string]failoverResult{"I": working(10)})
+	if !slices.Equal(h.sel.history(), []string{"I"}) {
+		t.Fatal("queued broken candidate was not selected", h.sel.history())
+	}
+}
+
+func TestFailoverStartupDiagnosticWithoutSwitch(t *testing.T) {
+	dir := t.TempDir()
+	h := newFailoverHarness(t, []string{"A", "B", "C"}, dir, false)
+	h.finish(h.collect(3), map[string]failoverResult{"A": working(10), "B": working(20)})
+	h.noSelection()
+	msg := <-h.logs
+	for _, want := range []string{"стартовая проверка:", "A: ok, 10 мс", "B: ok, 20 мс", "C: неудача, 0 мс", "выбран: A"} {
+		if !strings.Contains(msg, want) {
+			t.Fatalf("startup diagnostic %q missing %q", msg, want)
+		}
+	}
+	h.r.stop()
+	h.noErrorEvents(dir)
+	if msg := <-h.logs; msg != "сторож остановлен: осталось сирот — 0" || len(h.logs) != 0 {
+		t.Fatal("more than one startup diagnostic")
 	}
 }
 
@@ -659,7 +997,7 @@ func TestFailoverProbeTCPAndUDP(t *testing.T) {
 		{"UDP pending merge", true, false, true, true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			ctx, cancel := context.WithCancel(context.Background())
+			ctx, cancel := udpTestTimeout(context.Background(), FailoverTimeout)
 			defer cancel()
 			started := make(chan string, 2)
 			release := make(chan struct{})
@@ -713,7 +1051,8 @@ func TestFailoverProbeCanceledVersusDeadline(t *testing.T) {
 			ctx, cancel := context.WithCancel(context.Background())
 			if deadline {
 				cancel()
-				ctx, cancel = context.WithDeadline(context.Background(), time.Time{})
+				ctx, cancel = udpTestTimeout(context.Background(), FailoverTimeout)
+				ctx.(*failoverTestDeadline).expire()
 			} else {
 				cancel()
 			}
@@ -728,10 +1067,57 @@ func TestFailoverProbeCanceledVersusDeadline(t *testing.T) {
 	}
 }
 
+func TestFailoverTransportOrphanWaitsForBothParts(t *testing.T) {
+	for _, blocked := range []string{"TCP", "UDP"} {
+		t.Run(blocked, func(t *testing.T) {
+			ctx, cancel := udpTestTimeout(context.Background(), FailoverTimeout)
+			defer cancel()
+			started := make(chan string, 2)
+			release := make(chan struct{})
+			part := func(name string) {
+				started <- name
+				if name == blocked {
+					<-release
+				}
+			}
+			check := func(ctx context.Context, _ string) failoverResult {
+				return probeFailover(ctx, "test", nil,
+					func(context.Context, string, N.Dialer) (time.Duration, error) {
+						part("TCP")
+						return time.Millisecond, nil
+					}, func(context.Context, N.Dialer) error { part("UDP"); return nil })
+			}
+			workers := newFailoverWorkers()
+			work := workers.begin("A")
+			replies := make(chan failoverReply, 1)
+			go runFailoverProbe(ctx, check, workers, work, 1, replies)
+			<-started
+			<-started
+			ctx.(*failoverTestDeadline).expire()
+			workers.detach(work)
+			idle, count := workers.waiting()
+			if count != 1 {
+				t.Fatal("transport orphan disappeared before both parts ended")
+			}
+			select {
+			case <-replies:
+				t.Fatal("orphan returned while transport is still blocked")
+			default:
+			}
+			close(release)
+			<-idle
+			result := (<-replies).result
+			if result.OK || result.Canceled || len(workers.orphans) != 0 {
+				t.Fatal("transport deadline or orphan accounting lost", result)
+			}
+		})
+	}
+}
+
 func TestFailoverServiceLifecycleAndOneServer(t *testing.T) {
 	sel := &fakeSelector{now: "A"}
 	for _, tags := range [][]string{nil, {"A"}, {"A", "A"}} {
-		if newFailoverRun(FailoverOptions{}, sel, tags, nil, newRealTicker) != nil {
+		if newFailoverRun(context.Background(), FailoverOptions{}, sel, tags, nil, newRealTicker) != nil {
 			t.Fatal("run without two distinct servers")
 		}
 	}
