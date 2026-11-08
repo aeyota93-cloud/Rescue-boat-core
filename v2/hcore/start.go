@@ -193,9 +193,9 @@ func newRescueCompare() *rescuestats.Comparer {
 	})
 }
 
-// newRescueFailover — сторож автопереключения «основной → запасной» (docs/rescue-failover.md),
-// если приложение включило rescue-failover (иначе nil). Серверов меньше двух — сторож сам не
-// запустится. Событие переключения пишется в rescue-stats-dir, если она задана.
+// newRescueFailover включает сторожа v2 только при rescue-failover=true.
+// Стартовый выбор — самый быстрый рабочий; затем переход только при поломке.
+// Серверов меньше двух — сторож не запускается. События — в rescue-stats-dir.
 func newRescueFailover() *rescuestats.Failover {
 	hopt := static.HiddifyOptions
 	if hopt == nil || !hopt.RescueFailover {
