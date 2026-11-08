@@ -69,8 +69,8 @@ func (c *udpTestConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	return len(b), nil
 }
 
-func (c *udpTestConn) Close() error                       { c.once.Do(func() { close(c.closed) }); return nil }
-func (c *udpTestConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
+func (c *udpTestConn) Close() error        { c.once.Do(func() { close(c.closed) }); return nil }
+func (c *udpTestConn) LocalAddr() net.Addr { return &net.UDPAddr{} }
 func (c *udpTestConn) SetDeadline(t time.Time) error {
 	if c.noDeadline {
 		return os.ErrInvalid
