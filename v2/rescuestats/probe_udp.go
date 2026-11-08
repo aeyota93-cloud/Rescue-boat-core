@@ -88,9 +88,10 @@ func probeUDPTarget(ctx context.Context, dialer N.Dialer, dst M.Socksaddr, query
 		close(stop)
 		<-closed
 	}()
-	deadline, _ := ctx.Deadline()
-	if err := pc.SetDeadline(deadline); err != nil {
-		return false
+	// Многие пакетные соединения выходов sing (hysteria2, vless/xudp) deadline не поддерживают и
+	// возвращают ошибку — это не повод сдаваться: срок держит закрытие по ctx выше.
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = pc.SetDeadline(deadline)
 	}
 	if ctx.Err() != nil {
 		return false

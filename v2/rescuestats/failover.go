@@ -30,8 +30,8 @@ const (
 	FailoverMsgBroken  = "сервер не отвечает 25 с"
 )
 
-// заменяется на ProbeUDP при слиянии ветки failover-v2-udp
-var failoverUDPCheck func(ctx context.Context, d N.Dialer) error
+// UDP-часть пробы сервера (DNS через выход, probe_udp.go); тесты подменяют.
+var failoverUDPCheck func(ctx context.Context, d N.Dialer) error = ProbeUDP
 
 type FailoverOptions struct {
 	StatsDir  string

@@ -25,6 +25,7 @@ type udpTestConn struct {
 	once           sync.Once
 	deadline       time.Time
 	ignoreDeadline bool
+	noDeadline     bool // SetDeadline возвращает ошибку, как у пакетных соединений hysteria2/vless
 	respond        func(*dns.Msg, M.Socksaddr) []udpTestPacket
 }
 
@@ -70,7 +71,13 @@ func (c *udpTestConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 
 func (c *udpTestConn) Close() error                       { c.once.Do(func() { close(c.closed) }); return nil }
 func (c *udpTestConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }
-func (c *udpTestConn) SetDeadline(t time.Time) error      { c.deadline = t; return nil }
+func (c *udpTestConn) SetDeadline(t time.Time) error {
+	if c.noDeadline {
+		return os.ErrInvalid
+	}
+	c.deadline = t
+	return nil
+}
 func (c *udpTestConn) SetReadDeadline(t time.Time) error  { return c.SetDeadline(t) }
 func (c *udpTestConn) SetWriteDeadline(t time.Time) error { return c.SetDeadline(t) }
 
@@ -152,6 +159,31 @@ func TestProbeUDPResponses(t *testing.T) {
 				t.Fatal("соединение не закрыто")
 			}
 		})
+	}
+}
+
+// Живой тест 08.11 на всех 4 выходах: SetDeadline у них не поддержан, проба не должна сдаваться.
+func TestProbeUDPDeadlineUnsupported(t *testing.T) {
+	dst := M.ParseSocksaddrHostPort("1.1.1.1", 53)
+	c := newUDPTestConn()
+	c.noDeadline, c.ignoreDeadline = true, true
+	c.respond = func(q *dns.Msg, dst M.Socksaddr) []udpTestPacket { return []udpTestPacket{udpAnswer(q, dst, nil)} }
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := probeUDPTargets(ctx, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c}}, []M.Socksaddr{dst}); err != nil {
+		t.Fatalf("без поддержки deadline: %v", err)
+	}
+	// И без ответа проба кончается по сроку, а не висит.
+	c2 := newUDPTestConn()
+	c2.noDeadline, c2.ignoreDeadline = true, true
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel2()
+	start := time.Now()
+	if err := probeUDPTargets(ctx2, udpTestDialer{map[M.Socksaddr]*udpTestConn{dst: c2}}, []M.Socksaddr{dst}); err == nil {
+		t.Fatal("ожидалась ошибка")
+	}
+	if time.Since(start) > time.Second {
+		t.Fatal("проба зависла")
 	}
 }
 
