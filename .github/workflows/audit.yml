@@ -1,0 +1,131 @@
+name: Core audit
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['audit/**']
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CGO_ENABLED: '1'
+      GOTOOLCHAIN: local
+      GOFLAGS: -mod=readonly
+      GOBIN: ${{ runner.temp }}/audit-bin
+      BUILD_TAGS: with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc,with_awg,tfogo_checklinkname0,with_conntrack,with_purego
+    steps:
+      # Checkout переводит адреса подмодулей git@github.com в https.
+      - uses: actions/checkout@v6
+        timeout-minutes: 5
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Подготовка отчёта
+        run: |
+          bash scripts/audit/check.sh init
+          mkdir -p "$GOBIN"
+          echo "$GOBIN" >> "$GITHUB_PATH"
+
+      - uses: actions/setup-go@v5
+        id: go
+        timeout-minutes: 3
+        with:
+          go-version: '1.25.6'
+
+      - name: Патчи Шлюпки к hiddify-sing-box
+        id: patches
+        run: |
+          bash scripts/audit/check.sh run patches . bash -e -c '
+            for p in patches/hiddify-sing-box/*.patch; do
+              git -C hiddify-sing-box apply --verbose "../$p"
+            done
+          '
+
+      - name: Проверка gcc и Go
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run environment . bash -e -c '
+            if ! command -v gcc; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq gcc
+            fi
+            gcc --version
+            go version
+            go env CGO_ENABLED GOTOOLCHAIN GOFLAGS
+          '
+
+      - name: Установка анализаторов
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run install-staticcheck . \
+            bash -e -c 'go install honnef.co/go/tools/cmd/staticcheck@v0.7.0 && staticcheck -version' || true
+          bash scripts/audit/check.sh run install-golangci . \
+            bash -e -c 'go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.6.2 && golangci-lint version' || true
+          bash scripts/audit/check.sh run install-govulncheck . \
+            bash -e -c 'go install golang.org/x/vuln/cmd/govulncheck@v1.1.4 && govulncheck -version' || true
+
+      # Отдельный запуск для каждого пакета: ошибка hcore не прерывает остальные.
+      - name: Race, vet и Staticcheck своего кода
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          for package in config rescuestats hcore; do
+            bash scripts/audit/check.sh run "race-$package" . \
+              go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+              -ldflags=-checklinkname=0 "./v2/$package/..." || true
+            bash scripts/audit/check.sh run "vet-$package" . \
+              go vet -tags="$BUILD_TAGS" "./v2/$package/..." || true
+            bash scripts/audit/check.sh run "staticcheck-$package" . \
+              staticcheck -tags="$BUILD_TAGS" "./v2/$package/..." || true
+          done
+
+      - name: Race для изменённых пакетов sing-box
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run race-rule hiddify-sing-box \
+            go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            -ldflags=-checklinkname=0 ./route/rule/... || true
+          bash scripts/audit/check.sh run race-monitoring hiddify-sing-box \
+            go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            -ldflags=-checklinkname=0 ./common/monitoring/... || true
+
+      - name: golangci-lint для v2
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run golangci-lint . \
+            golangci-lint run --config .golangci.yml --build-tags="$BUILD_TAGS" ./v2/...
+
+      - name: govulncheck для корневого модуля
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run govulncheck . \
+            govulncheck -tags="$BUILD_TAGS" ./...
+
+      - name: Сводка
+        if: always()
+        run: |
+          bash scripts/audit/check.sh summary
+          cat audit-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        timeout-minutes: 2
+        with:
+          name: audit-core
+          path: audit-out/
+          if-no-files-found: error
+          retention-days: 7

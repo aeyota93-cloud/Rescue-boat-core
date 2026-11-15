@@ -1,0 +1,35 @@
+version: '2'
+
+run:
+  go: '1.25'
+  timeout: 4m
+  tests: true
+  modules-download-mode: readonly
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - bodyclose
+    - contextcheck
+    - noctx
+    - gocritic
+    - ineffassign
+    - govet
+    - staticcheck
+  exclusions:
+    presets: []
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false
+  fix: false
+
+output:
+  formats:
+    text:
+      path: stdout
+      colors: false
+      print-issued-lines: false
+      print-linter-name: true
