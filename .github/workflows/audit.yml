@@ -19,7 +19,6 @@ jobs:
       CGO_ENABLED: '1'
       GOTOOLCHAIN: local
       GOFLAGS: -mod=readonly
-      GOBIN: ${{ runner.temp }}/audit-bin
       BUILD_TAGS: with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc,with_awg,tfogo_checklinkname0,with_conntrack,with_purego
     steps:
       # Checkout переводит адреса подмодулей git@github.com в https.
@@ -32,8 +31,10 @@ jobs:
       - name: Подготовка отчёта
         run: |
           bash scripts/audit/check.sh init
-          mkdir -p "$GOBIN"
-          echo "$GOBIN" >> "$GITHUB_PATH"
+          # runner.temp нельзя использовать в env задачи: GOBIN задаём здесь.
+          echo "GOBIN=$RUNNER_TEMP/audit-bin" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/audit-bin"
+          echo "$RUNNER_TEMP/audit-bin" >> "$GITHUB_PATH"
 
       - uses: actions/setup-go@v5
         id: go
@@ -120,6 +121,8 @@ jobs:
         run: |
           bash scripts/audit/check.sh summary
           cat audit-out/summary.md >> "$GITHUB_STEP_SUMMARY"
+          # Журналы без входа не читаются, пометки (annotations) — читаются.
+          grep '^| \[' audit-out/summary.md | while IFS= read -r line; do echo "::notice title=audit summary::$line"; done
 
       - uses: actions/upload-artifact@v6
         if: always()
