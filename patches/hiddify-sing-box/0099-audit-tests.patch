@@ -1,0 +1,621 @@
+diff --git a/adapter/endpoint/audit_c1_08_test.go b/adapter/endpoint/audit_c1_08_test.go
+new file mode 100644
+index 0000000..d593acb
+--- /dev/null
++++ b/adapter/endpoint/audit_c1_08_test.go
+@@ -0,0 +1,43 @@
++package endpoint
++
++import (
++	"context"
++	"testing"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/log"
++)
++
++type auditC108Endpoint struct {
++	adapter.Endpoint
++	closes int
++}
++
++func (*auditC108Endpoint) Type() string { return "audit" }
++func (*auditC108Endpoint) Tag() string  { return "audit-awg" }
++func (e *auditC108Endpoint) Close() error {
++	e.closes++
++	return nil
++}
++
++func TestAudit_C1_08_ManagerClosesUnstartedEndpoint(t *testing.T) {
++	e := new(auditC108Endpoint)
++	registry := NewRegistry()
++	Register[struct{}](registry, "audit", func(context.Context, adapter.Router, log.ContextLogger, string, struct{}) (adapter.Endpoint, error) {
++		return e, nil
++	})
++	logger := log.NewNOPFactory().Logger()
++	m := NewManager(logger, registry)
++	if err := m.Create(context.Background(), nil, logger, e.Tag(), e.Type(), nil); err != nil {
++		t.Fatalf("C1-08: ожидали создание endpoint без запуска, получили %v", err)
++	}
++	// Проверка конфига создаёт endpoint и закрывает менеджер без Start.
++	for i := 0; i < 2; i++ {
++		if err := m.Close(); err != nil {
++			t.Fatalf("C1-08: ожидали закрытие менеджера без ошибки, получили %v", err)
++		}
++	}
++	if e.closes != 1 {
++		t.Fatalf("C1-08: ожидали одно закрытие созданного endpoint до Start, получили %d", e.closes)
++	}
++}
+diff --git a/audit_c1_05_test.go b/audit_c1_05_test.go
+new file mode 100644
+index 0000000..71d3f7b
+--- /dev/null
++++ b/audit_c1_05_test.go
+@@ -0,0 +1,7 @@
++package box
++
++import "testing"
++
++func TestAudit_C1_05_StartWaitsForPreviousClose(t *testing.T) {
++	t.Skip("C1-05: запрет нового Start при незавершённом Close находится в hcore вне этого подмодуля; closeWithTimeout в box.go возвращает только error и не предоставляет сигнал завершения, а требовать от него ожидания после таймаута означало бы проверять другой контракт")
++}
+diff --git a/common/monitoring/audit_c1_06_test.go b/common/monitoring/audit_c1_06_test.go
+new file mode 100644
+index 0000000..8184c1b
+--- /dev/null
++++ b/common/monitoring/audit_c1_06_test.go
+@@ -0,0 +1,26 @@
++package monitoring
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func TestAudit_C1_06_SlowSubscriberReceivesLatestState(t *testing.T) {
++	b := NewBroadcaster[string](context.Background())
++	defer b.Close()
++	subscription := b.Subscribe(1)
++	defer b.Unsubscribe(subscription)
++
++	// Пока подписчик занят предыдущим Send, очередь вмещает один переход.
++	b.Publish("STOPPING")
++	b.Publish("STOPPED")
++	select {
++	case state, ok := <-subscription:
++		if !ok || state != "STOPPED" {
++			t.Fatalf("C1-06: ожидали последнее состояние STOPPED после переполнения, получили %q (канал открыт: %v)", state, ok)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("C1-06: ожидали последнее состояние за 2 с, не получили события")
++	}
++}
+diff --git a/common/monitoring/audit_c2_04_test.go b/common/monitoring/audit_c2_04_test.go
+new file mode 100644
+index 0000000..20bf3de
+--- /dev/null
++++ b/common/monitoring/audit_c2_04_test.go
+@@ -0,0 +1,106 @@
++package monitoring
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing/service/pause"
++)
++
++type auditC204LoopLogger struct {
++	log.ContextLogger
++	entered chan struct{}
++	release chan struct{}
++	once    sync.Once
++}
++
++func (l *auditC204LoopLogger) Info(args ...any) {
++	if fmt.Sprint(args...) == "outbound monitoring schedule loop started" {
++		l.once.Do(func() {
++			close(l.entered)
++			<-l.release
++		})
++	}
++}
++
++func TestAudit_C2_04_SchedulerSurvivesStopBeforeSelect(t *testing.T) {
++	ctx := pause.WithDefaultManager(context.Background())
++	logger := &auditC204LoopLogger{
++		ContextLogger: log.NewNOPFactory().Logger(),
++		entered:       make(chan struct{}),
++		release:       make(chan struct{}),
++	}
++	var releaseOnce sync.Once
++	release := func() { releaseOnce.Do(func() { close(logger.release) }) }
++	defer release()
++	m, err := NewOutboundMonitoring(ctx, logger, option.MonitoringOptions{})
++	if err != nil {
++		t.Fatalf("C2-04: ожидали создание monitoring, получили %v", err)
++	}
++	defer m.cancel()
++	// Состояние startTimerWorkers непосредственно перед go scheduleLoop().
++	// Запускаем тот же loop с recover, чтобы его паника не оборвала пакет.
++	ticker := time.NewTicker(time.Hour)
++	defer ticker.Stop()
++	m.mainTicker = ticker
++	m.pauseCallback = pause.RegisterTicker(m.pause, ticker, time.Hour, nil)
++	m.workersRunning.Store(true)
++	m.schedulerWG.Add(1)
++	result := make(chan any, 1)
++	go func() {
++		defer func() { result <- recover() }()
++		m.scheduleLoop()
++	}()
++	deadline := time.NewTimer(2 * time.Second)
++	defer deadline.Stop()
++	select {
++	case <-logger.entered:
++	case <-deadline.C:
++		t.Fatal("C2-04: ожидали вход планировщика за 2 с, получили зависание")
++	}
++	// Тот же порядок возможен при Close сразу после Touch. Барьер делает
++	// проверку nil-паники детерминированной, detector гонок здесь не нужен.
++	m.stopTimerWorkers()
++	m.cancel()
++	release()
++	select {
++	case p := <-result:
++		if p != nil {
++			t.Fatalf("C2-04: ожидали выход планировщика после остановки ticker без паники, получили %v", p)
++		}
++	case <-deadline.C:
++		t.Fatal("C2-04: ожидали завершение остановленного планировщика за 2 с, получили зависание")
++	}
++}
++
++func TestAudit_C2_04_TouchDoesNotRestartClosedMonitor(t *testing.T) {
++	ctx := pause.WithDefaultManager(context.Background())
++	m, err := NewOutboundMonitoring(ctx, log.NewNOPFactory().Logger(), option.MonitoringOptions{})
++	if err != nil {
++		t.Fatalf("C2-04: ожидали создание monitoring, получили %v", err)
++	}
++	// Для Touch важен результат PostStart; сетевые workers здесь не нужны.
++	m.started = true
++	if err := m.Close(); err != nil {
++		t.Fatalf("C2-04: ожидали закрытие monitoring, получили %v", err)
++	}
++	m.Touch()
++	restarted := m.workersRunning.Load()
++	done := make(chan struct{})
++	go func() { m.schedulerWG.Wait(); close(done) }()
++	select {
++	case <-done:
++		// После завершения loop безопасно убрать созданный ошибочным Touch ticker.
++		m.stopTimerWorkers()
++	case <-time.After(2 * time.Second):
++		t.Fatal("C2-04: ожидали завершение планировщика отменённого monitoring за 2 с, получили зависание")
++	}
++	if restarted {
++		t.Fatal("C2-04: ожидали, что Touch после Close не запустит ticker, получили workersRunning=true")
++	}
++}
+diff --git a/common/urltest/audit_c2_05_test.go b/common/urltest/audit_c2_05_test.go
+new file mode 100644
+index 0000000..b71bf69
+--- /dev/null
++++ b/common/urltest/audit_c2_05_test.go
+@@ -0,0 +1,112 @@
++package urltest
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"testing"
++	"time"
++
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++type auditC205Dialer struct{ conn net.Conn }
++
++func (d auditC205Dialer) DialContext(context.Context, string, M.Socksaddr) (net.Conn, error) {
++	return d.conn, nil
++}
++
++func (auditC205Dialer) ListenPacket(context.Context, M.Socksaddr) (net.PacketConn, error) {
++	return nil, errors.New("C2-05: неожиданный ListenPacket")
++}
++
++func TestAudit_C2_05_UnifiedSecondRequestHonorsContext(t *testing.T) {
++	client, server := net.Pipe()
++	defer client.Close()
++	defer server.Close()
++	// Предохранитель для обеих горутин, в том числе при регрессии HTTP Transport.
++	deadline := time.Now().Add(3 * time.Second)
++	_ = client.SetDeadline(deadline)
++	_ = server.SetDeadline(deadline)
++	secondRequest := make(chan error, 1)
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		reader := bufio.NewReader(server)
++		for i := 0; i < 2; i++ {
++			req, err := http.ReadRequest(reader)
++			if err != nil {
++				secondRequest <- fmt.Errorf("чтение HEAD %d: %w", i+1, err)
++				return
++			}
++			req.Body.Close()
++			if req.Method != http.MethodHead {
++				secondRequest <- fmt.Errorf("ожидали HEAD, получили %s", req.Method)
++				return
++			}
++			if i == 0 {
++				if _, err := io.WriteString(server, "HTTP/1.1 204 No Content\r\n\r\n"); err != nil {
++					secondRequest <- err
++					return
++				}
++			} else {
++				secondRequest <- nil
++				// Второй HEAD оставляем без ответа. Read завершается при cleanup
++				// либо когда HTTP Transport закроет pipe по контексту запроса.
++				var b [1]byte
++				_, _ = server.Read(b[:])
++			}
++		}
++	}()
++	ctx, cancel := context.WithCancel(ContextWithIsUnifiedDelay(context.Background()))
++	defer cancel()
++	result := make(chan error, 1)
++	go func() {
++		_, err := URLTest(ctx, "http://audit.invalid/generate_204", auditC205Dialer{client})
++		result <- err
++	}()
++	guard := time.NewTimer(2 * time.Second)
++	defer guard.Stop()
++	select {
++	case err := <-secondRequest:
++		if err != nil {
++			t.Fatalf("C2-05: ожидали два HEAD через net.Pipe, получили %v", err)
++		}
++	case <-guard.C:
++		t.Fatal("C2-05: ожидали второй HEAD за 2 с, получили зависание")
++	}
++	// Отмена строго после входа второго запроса: первая проверка ctx уже пройдена.
++	cancel()
++	returned := false
++	var resultErr error
++	select {
++	case resultErr = <-result:
++		returned = true
++	case <-time.After(100 * time.Millisecond):
++	}
++	// Освобождаем обе горутины до сообщения о сбое, сохраняя исходный результат.
++	client.Close()
++	server.Close()
++	if !returned {
++		select {
++		case <-result:
++		case <-guard.C:
++			t.Fatal("C2-05: ожидали завершение URLTest после закрытия pipe за 2 с, получили зависание")
++		}
++	}
++	select {
++	case <-serverDone:
++	case <-guard.C:
++		t.Fatal("C2-05: ожидали завершение обработчика net.Pipe за 2 с, получили зависание")
++	}
++	if !returned {
++		t.Fatal("C2-05: ожидали завершение второго HEAD за 100 мс после отмены контекста, получили ожидание до принудительного закрытия pipe")
++	}
++	if !errors.Is(resultErr, context.Canceled) {
++		t.Fatalf("C2-05: ожидали context.Canceled от второго HEAD, получили %v", resultErr)
++	}
++}
+diff --git a/daemon/audit_c1_09_test.go b/daemon/audit_c1_09_test.go
+new file mode 100644
+index 0000000..74433fd
+--- /dev/null
++++ b/daemon/audit_c1_09_test.go
+@@ -0,0 +1,61 @@
++package daemon
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing/service"
++)
++
++func TestAudit_C1_09_CanceledFailedServiceClosesFiveObservers(t *testing.T) {
++	ctx, cancel := context.WithCancel(service.ContextWithDefaultRegistry(context.Background()))
++	defer cancel()
++	s := NewStartedService(ServiceOptions{Context: ctx})
++	// Убираем все пять process даже при падении проверки. Закрытие subscriber
++	// через Observer.Close — штатный механизм завершения observable.
++	defer s.serviceStatusObserver.Close()
++	defer s.logObserver.Close()
++	defer s.urlTestObserver.Close()
++	defer s.clashModeObserver.Close()
++	defer s.connectionEventObserver.Close()
++
++	_, statusDone := s.serviceStatusSubscriber.Subscription()
++	_, logDone := s.logSubscriber.Subscription()
++	_, urlTestDone := s.urlTestSubscriber.Subscription()
++	_, clashDone := s.clashModeSubscriber.Subscription()
++	_, connectionDone := s.connectionEventSubscriber.Subscription()
++	observers := []struct {
++		name string
++		done <-chan struct{}
++	}{
++		{"serviceStatus", statusDone},
++		{"log", logDone},
++		{"urlTest", urlTestDone},
++		{"clashMode", clashDone},
++		{"connectionEvent", connectionDone},
++	}
++	// Ошибка разбора возникает до Box.New: ни сеть, ни платформа не нужны.
++	if err := s.StartOrReloadService("{", nil); err == nil {
++		t.Fatal("C1-09: ожидали ошибку запуска с неверным JSON, получили nil")
++	}
++	// Это окончательное завершение владельца, а не CloseService для reload.
++	cancel()
++	deadline := time.NewTimer(2 * time.Second)
++	defer deadline.Stop()
++	for i, observer := range observers {
++		select {
++		case <-observer.done:
++		case <-deadline.C:
++			// Один общий срок для всех пяти, без пяти последовательных ожиданий.
++			for _, remaining := range observers[i:] {
++				select {
++				case <-remaining.done:
++				default:
++					t.Errorf("C1-09: ожидали закрытие Observer %s после ошибки запуска и отмены владельца за 2 с, получили открытый subscriber", remaining.name)
++				}
++			}
++			return
++		}
++	}
++}
+diff --git a/route/audit_c2_06_test.go b/route/audit_c2_06_test.go
+new file mode 100644
+index 0000000..3d34a87
+--- /dev/null
++++ b/route/audit_c2_06_test.go
+@@ -0,0 +1,106 @@
++package route
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net"
++	"strings"
++	"sync/atomic"
++	"testing"
++
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing/common/buf"
++	M "github.com/sagernet/sing/common/metadata"
++)
++
++type auditC206Logger struct {
++	log.ContextLogger
++	entries []log.Entry
++}
++
++func (l *auditC206Logger) DebugContext(_ context.Context, args ...any) {
++	l.entries = append(l.entries, log.Entry{Level: log.LevelDebug, Message: fmt.Sprint(args...)})
++}
++
++func (l *auditC206Logger) ErrorContext(_ context.Context, args ...any) {
++	l.entries = append(l.entries, log.Entry{Level: log.LevelError, Message: fmt.Sprint(args...)})
++}
++
++func (l *auditC206Logger) TraceContext(_ context.Context, args ...any) {
++	l.entries = append(l.entries, log.Entry{Level: log.LevelTrace, Message: fmt.Sprint(args...)})
++}
++
++type auditC206Reader struct {
++	err   error
++	reads int
++}
++
++func (r *auditC206Reader) ReadPacket(buffer *buf.Buffer) (M.Socksaddr, error) {
++	r.reads++
++	if r.reads == 1 {
++		_, _ = buffer.Write([]byte("established UDP payload"))
++		return M.ParseSocksaddr("192.0.2.1:443"), nil
++	}
++	return M.Socksaddr{}, r.err
++}
++
++type auditC206Writer struct{ packets int }
++
++func (w *auditC206Writer) WritePacket(buffer *buf.Buffer, _ M.Socksaddr) error {
++	w.packets++
++	buffer.Release()
++	return nil
++}
++
++func TestAudit_C2_06_EstablishedUDPFailureLoggedAtError(t *testing.T) {
++	failure := errors.New("read: connection reset by peer")
++	for _, tc := range []struct {
++		name      string
++		download  bool
++		err       error
++		wantError bool
++	}{
++		{"upload_failure", false, failure, true},
++		{"download_failure", true, failure, true},
++		{"upload_normal_close", false, net.ErrClosed, false},
++		{"download_normal_close", true, net.ErrClosed, false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			logger := &auditC206Logger{ContextLogger: log.NewNOPFactory().Logger()}
++			manager := NewConnectionManager(logger)
++			reader := &auditC206Reader{err: tc.err}
++			writer := new(auditC206Writer)
++			var done atomic.Bool
++			closed := 0
++			var closeErr error
++			manager.packetConnectionCopy(context.Background(), reader, writer, tc.download, &done, func(err error) {
++				closed++
++				closeErr = err
++			})
++			if writer.packets != 1 || closed != 1 || !errors.Is(closeErr, tc.err) {
++				t.Fatalf("C2-06: ожидали один доставленный UDP-пакет и один callback с причиной %v, получили пакетов=%d, callback=%d, причина=%v", tc.err, writer.packets, closed, closeErr)
++			}
++			direction := "upload"
++			if tc.download {
++				direction = "download"
++			}
++			found := false
++			for _, entry := range logger.entries {
++				if entry.Level == log.LevelError && strings.Contains(entry.Message, "packet "+direction+" closed: ") && strings.Contains(entry.Message, tc.err.Error()) {
++					found = true
++				}
++			}
++			if tc.wantError && !found {
++				t.Fatalf("C2-06: ожидали Error с причиной обрыва установленной UDP-сессии, получили %v", logger.entries)
++			}
++			if !tc.wantError {
++				for _, entry := range logger.entries {
++					if entry.Level == log.LevelError {
++						t.Fatalf("C2-06: ожидали штатное закрытие UDP без Error, получили %v", logger.entries)
++					}
++				}
++			}
++		})
++	}
++}
+diff --git a/route/rule/audit_c1_03_test.go b/route/rule/audit_c1_03_test.go
+new file mode 100644
+index 0000000..6c0c054
+--- /dev/null
++++ b/route/rule/audit_c1_03_test.go
+@@ -0,0 +1,73 @@
++package rule
++
++import (
++	"context"
++	"fmt"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/option"
++)
++
++// Гонка reloadRules/Match ловится только с -race.
++func TestAudit_C1_03_LocalReloadConcurrentMatch(t *testing.T) {
++	rules := [][]option.HeadlessRule{
++		{{DefaultOptions: option.DefaultHeadlessRule{Domain: []string{"audit.example"}}}},
++		{{DefaultOptions: option.DefaultHeadlessRule{DomainSuffix: []string{"example"}}}},
++	}
++	s := &LocalRuleSet{ctx: context.Background()}
++	if err := s.reloadRules(rules[0]); err != nil {
++		t.Fatalf("C1-03: ожидали загрузку исходного правила, получили %v", err)
++	}
++	start := make(chan struct{})
++	stop := make(chan struct{})
++	defer close(stop)
++	errors := make(chan error, 4)
++	var wg sync.WaitGroup
++	for worker := 0; worker < 4; worker++ {
++		wg.Add(1)
++		go func(worker int) {
++			defer wg.Done()
++			defer func() {
++				if p := recover(); p != nil {
++					errors <- fmt.Errorf("ожидали работу без паники, получили %v", p)
++				}
++			}()
++			<-start
++			for i := 0; i < 1000; i++ {
++				select {
++				case <-stop:
++					return
++				default:
++				}
++				if worker == 0 {
++					if err := s.reloadRules(rules[i%len(rules)]); err != nil {
++						errors <- fmt.Errorf("ожидали загрузку валидного правила, получили %v", err)
++						return
++					}
++				} else {
++					// Match меняет кеш metadata: каждый вызов получает свой объект.
++					metadata := &adapter.InboundContext{Domain: "audit.example"}
++					if !s.Match(metadata) {
++						errors <- fmt.Errorf("ожидали совпадение с обоими вариантами правил, получили false")
++						return
++					}
++				}
++			}
++		}(worker)
++	}
++	done := make(chan struct{})
++	go func() { wg.Wait(); close(done) }()
++	close(start)
++	select {
++	case <-done:
++		close(errors)
++		for err := range errors {
++			t.Errorf("C1-03: %v", err)
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("C1-03: ожидали завершение reloadRules и Match за 2 с, получили зависание")
++	}
++}
+diff --git a/transport/awg/audit_c1_08_test.go b/transport/awg/audit_c1_08_test.go
+new file mode 100644
+index 0000000..e323a29
+--- /dev/null
++++ b/transport/awg/audit_c1_08_test.go
+@@ -0,0 +1,33 @@
++package awg
++
++import "testing"
++
++type auditC108Tun struct {
++	tunAdapter
++	closes int
++}
++
++func (t *auditC108Tun) Close() error {
++	t.closes++
++	return nil
++}
++
++func TestAudit_C1_08_DeviceClosesTunBeforeStartOnce(t *testing.T) {
++	defer func() {
++		if p := recover(); p != nil {
++			t.Fatalf("C1-08: ожидали закрытие AWG до Start без паники, получили %v", p)
++		}
++	}()
++	tun := new(auditC108Tun)
++	// Состояние после NewDevice: tun уже создан, awgDevice ещё отсутствует.
++	// Подмена tun позволяет проверить владение без настоящего netstack и VPN.
++	d := &Device{tun: tun}
++	for i := 0; i < 2; i++ {
++		if err := d.Close(); err != nil {
++			t.Fatalf("C1-08: ожидали закрытие AWG без ошибки, получили %v", err)
++		}
++	}
++	if tun.closes != 1 {
++		t.Fatalf("C1-08: ожидали одно закрытие tun до Start, получили %d", tun.closes)
++	}
++}

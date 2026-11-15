@@ -83,7 +83,7 @@ jobs:
         run: |
           for package in config rescuestats hcore; do
             bash scripts/audit/check.sh run "race-$package" . \
-              go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+              go test -race -vet=off -count=1 -timeout=3m -skip TestAudit -tags="$BUILD_TAGS" \
               -ldflags=-checklinkname=0 "./v2/$package/..." || true
             bash scripts/audit/check.sh run "vet-$package" . \
               go vet -tags="$BUILD_TAGS" "./v2/$package/..." || true
@@ -96,11 +96,28 @@ jobs:
         continue-on-error: true
         run: |
           bash scripts/audit/check.sh run race-rule hiddify-sing-box \
-            go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            go test -race -vet=off -count=1 -timeout=3m -skip TestAudit -tags="$BUILD_TAGS" \
             -ldflags=-checklinkname=0 ./route/rule/... || true
           bash scripts/audit/check.sh run race-monitoring hiddify-sing-box \
-            go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            go test -race -vet=off -count=1 -timeout=3m -skip TestAudit -tags="$BUILD_TAGS" \
             -ldflags=-checklinkname=0 ./common/monitoring/... || true
+
+      # Этап 3: тесты аудита обязаны ПАДАТЬ сейчас (каждый доказывает находку).
+      - name: Тесты аудита (должны падать)
+        if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}
+        continue-on-error: true
+        run: |
+          bash scripts/audit/check.sh run audit-core . \
+            go test -race -v -count=1 -timeout=3m -run TestAudit -tags="$BUILD_TAGS" \
+            -ldflags=-checklinkname=0 ./v2/config/ ./v2/hcore/ ./v2/rescuestats/ || true
+          bash scripts/audit/check.sh run audit-singbox hiddify-sing-box \
+            go test -race -v -count=1 -timeout=3m -run TestAudit -tags="$BUILD_TAGS" \
+            -ldflags=-checklinkname=0 . ./route ./route/rule ./common/monitoring ./common/urltest \
+            ./adapter/endpoint ./transport/awg ./daemon || true
+          # Пометка: итог каждого теста и признаки гонок.
+          for n in audit-core audit-singbox; do
+            echo "::notice title=$n results::$(grep -E '^--- (FAIL|PASS|SKIP): TestAudit|WARNING: DATA RACE|race detected during execution of test|^(ok|FAIL)[[:space:]]' "audit-out/$n.txt" | sed 's/WARNING: DATA RACE/DATA RACE/' | uniq -c | cut -c1-200 | awk 'BEGIN{ORS="%0A"} {print}')"
+          done
 
       - name: golangci-lint для v2
         if: ${{ always() && steps.go.outcome == 'success' && steps.patches.outcome == 'success' }}

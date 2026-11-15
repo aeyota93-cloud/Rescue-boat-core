@@ -8,7 +8,7 @@ checks=(patches environment install-staticcheck install-golangci install-govulnc
   race-config vet-config staticcheck-config
   race-rescuestats vet-rescuestats staticcheck-rescuestats
   race-hcore vet-hcore staticcheck-hcore race-rule race-monitoring
-  golangci-lint govulncheck)
+  golangci-lint govulncheck audit-core audit-singbox)
 mkdir -p "$out"
 
 case "${1:-}" in
@@ -29,7 +29,7 @@ case "${1:-}" in
       install-staticcheck) limit=3m ;;
       install-golangci) limit=5m ;;
       install-govulncheck) limit=2m ;;
-      race-*) limit=4m ;;
+      race-*|audit-*) limit=4m ;;
       vet-*|staticcheck-*) limit=90s ;;
       golangci-lint) limit=4m ;;
       govulncheck) limit=3m ;;
