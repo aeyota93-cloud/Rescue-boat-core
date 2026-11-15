@@ -122,7 +122,14 @@ jobs:
           bash scripts/audit/check.sh summary
           cat audit-out/summary.md >> "$GITHUB_STEP_SUMMARY"
           # Журналы без входа не читаются, пометки (annotations) — читаются.
-          grep '^| \[' audit-out/summary.md | while IFS= read -r line; do echo "::notice title=audit summary::$line"; done
+          # Одна пометка на всю сводку (лимит — 10 пометок на шаг) и хвосты непройденных проверок.
+          echo "::notice title=audit summary::$(awk 'BEGIN{ORS="%0A"} /^\| \[/ {gsub(/\]\([^)]*\)/,"]"); print}' audit-out/summary.md)"
+          for f in audit-out/*.exit; do
+            n=$(basename "$f" .exit); c=$(cat "$f")
+            if [ "$c" != 0 ] && [ "$c" != 'NOT RUN' ]; then
+              echo "::notice title=$n::$(grep -E 'DATA RACE|--- FAIL|FAIL|panic|\.go:[0-9]+|Vulnerability #|Error' "audit-out/$n.txt" | head -60 | cut -c1-220 | awk 'BEGIN{ORS="%0A"} {print}')"
+            fi
+          done
 
       - uses: actions/upload-artifact@v6
         if: always()
