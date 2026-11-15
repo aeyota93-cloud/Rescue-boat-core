@@ -83,7 +83,7 @@ jobs:
         run: |
           for package in config rescuestats hcore; do
             bash scripts/audit/check.sh run "race-$package" . \
-              go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+              go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
               -ldflags=-checklinkname=0 "./v2/$package/..." || true
             bash scripts/audit/check.sh run "vet-$package" . \
               go vet -tags="$BUILD_TAGS" "./v2/$package/..." || true
@@ -96,10 +96,10 @@ jobs:
         continue-on-error: true
         run: |
           bash scripts/audit/check.sh run race-rule hiddify-sing-box \
-            go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
             -ldflags=-checklinkname=0 ./route/rule/... || true
           bash scripts/audit/check.sh run race-monitoring hiddify-sing-box \
-            go test -race -count=1 -timeout=3m -tags="$BUILD_TAGS" \
+            go test -race -vet=off -count=1 -timeout=3m -tags="$BUILD_TAGS" \
             -ldflags=-checklinkname=0 ./common/monitoring/... || true
 
       - name: golangci-lint для v2
