@@ -135,7 +135,8 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 	stats := newRescueStats()
 	compare := newRescueCompare()
 	failover := newRescueFailover()
-	instance, err := newService(ctx, *options, stats, compare, failover)
+	lanes := newRescueLanes()
+	instance, err := newService(ctx, *options, stats, compare, failover, lanes)
 	if err != nil {
 		if stats != nil {
 			stats.Close()
@@ -145,6 +146,9 @@ func StartService(ctx context.Context, in *StartRequest) (coreResponse *CoreInfo
 		}
 		if failover != nil {
 			failover.Close()
+		}
+		if lanes != nil {
+			lanes.Close()
 		}
 		return errorWrapper(MessageType_START_SERVICE, err)
 	}
@@ -207,6 +211,27 @@ func newRescueFailover() *rescuestats.Failover {
 		SelectTag: config.OutboundSelectTag,
 		Log: func(msg string) {
 			Log(LogLevel_INFO, LogType_CORE, msg)
+		},
+	})
+}
+
+// newRescueLanes — полосы групп (config/lanes.go) следуют за выбранным сервером. Без папки
+// списков полос в конфиге нет, служба тогда ничего не делает.
+func newRescueLanes() *rescuestats.LaneSync {
+	hopt := static.HiddifyOptions
+	if hopt == nil || hopt.SplitTunnelDir == "" {
+		return nil
+	}
+	lanes := make([]string, config.LaneCount)
+	for n := range lanes {
+		lanes[n] = config.LaneTag(n)
+	}
+	return rescuestats.NewLaneSync(rescuestats.LaneSyncOptions{
+		SelectTag: config.OutboundSelectTag,
+		Lanes:     lanes,
+		CopyTag:   config.LaneCopyTag,
+		Log: func(msg string) {
+			Log(LogLevel_DEBUG, LogType_CORE, msg)
 		},
 	})
 }

@@ -16,12 +16,12 @@ import (
 )
 
 func NewService(ctx context.Context, options option.Options) (*daemon.StartedService, error) {
-	return newService(ctx, options, nil, nil, nil)
+	return newService(ctx, options, nil, nil, nil, nil)
 }
 
 // newService — то же, но со сборщиком статистики, службой «Сравнить пути» и сторожем
-// автопереключения (nil — без них).
-func newService(ctx context.Context, options option.Options, stats *rescuestats.Collector, compare *rescuestats.Comparer, failover *rescuestats.Failover) (*daemon.StartedService, error) {
+// автопереключения и полосами групп (nil — без них).
+func newService(ctx context.Context, options option.Options, stats *rescuestats.Collector, compare *rescuestats.Comparer, failover *rescuestats.Failover, lanes *rescuestats.LaneSync) (*daemon.StartedService, error) {
 	extraServices := []adapter.LifecycleService{&hiddifyMainServiceManager{}}
 	if stats != nil {
 		extraServices = append(extraServices, stats)
@@ -31,6 +31,9 @@ func newService(ctx context.Context, options option.Options, stats *rescuestats.
 	}
 	if failover != nil {
 		extraServices = append(extraServices, failover)
+	}
+	if lanes != nil {
+		extraServices = append(extraServices, lanes)
 	}
 
 	// ctx = filemanager.WithDefault(ctx, sWorkingPath, sTempPath, sUserID, sGroupID)
@@ -56,6 +59,9 @@ func newService(ctx context.Context, options option.Options, stats *rescuestats.
 	}
 	if failover != nil {
 		failover.Bind(instance)
+	}
+	if lanes != nil {
+		lanes.Bind(instance)
 	}
 
 	// for i := 0; i < 10; i++ {

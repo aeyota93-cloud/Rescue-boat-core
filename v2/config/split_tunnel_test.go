@@ -113,8 +113,8 @@ func TestSplitTunnelRuleSetPathFromWorkingDir(t *testing.T) {
 			t.Errorf("sing-box не найдёт %q: %v", p, err)
 		}
 	}
-	if found != 4 {
-		t.Fatalf("ожидалось 4 локальных набора правил, найдено %d", found)
+	if found != 4+LaneCount {
+		t.Fatalf("ожидалось %d локальных наборов правил (4 списка и полосы), найдено %d", 4+LaneCount, found)
 	}
 }
 

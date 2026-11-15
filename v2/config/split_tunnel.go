@@ -11,7 +11,9 @@ package config
 //                        блокировкой рекламы (файл необязательный, без него — пустой);
 //   via-server-<key>.json  то, что пользователь закрепил за одним сервером из `select`
 //                        (docs/rescue-servers-v2.md, key — ServerKey(тег)); файлы есть только
-//                        для серверов профиля и только когда серверов два и больше.
+//                        для серверов профиля и только когда серверов два и больше;
+//   via-lane-<n>.json    записи одной группы «через VPN»: своё соединение с выбранным
+//                        сервером (lanes.go), n от 0 до LaneCount-1.
 // Это локальные наборы правил: sing-box следит за файлами и перечитывает их при изменении,
 // а поиск программ включает сам, как только в наборе появляется правило по программе.
 // Списки стоят выше всех остальных правил (сервера, региона, пользовательских); закреплённое
@@ -20,6 +22,7 @@ package config
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +44,7 @@ const (
 	splitBypassTag        = "rescue-bypass-vpn"
 	splitBypassDomainsTag = "rescue-bypass-domains"
 	splitViaServerPrefix  = "rescue-via-server-"
+	splitViaLanePrefix    = "rescue-via-lane-"
 )
 
 // Пустой набор правил: файл должен существовать, иначе sing-box не запустится.
@@ -134,6 +138,22 @@ func splitTunnelRules(options *option.Options, hopt *HiddifyOptions) rescueRules
 				DefaultOptions: option.DefaultRule{
 					RawDefaultRule: option.RawDefaultRule{RuleSet: []string{setTag}},
 					RuleAction:     routeAction(tag),
+				},
+			})
+		}
+	}
+	// Полосы групп (lanes.go): записи группы «через VPN» идут своим соединением с тем же
+	// сервером. Ниже закреплённых за сервером, выше общего «через VPN». С WARP поверх VPN
+	// полос нет: они шли бы мимо WARP.
+	if OutboundMainDetour == OutboundSelectTag {
+		for n, lane := range addLanes(options) {
+			setTag := fmt.Sprintf("%s%d", splitViaLanePrefix, n)
+			res.ruleSets = append(res.ruleSets, local(setTag, fmt.Sprintf("via-lane-%d.json", n)))
+			res.route = append(res.route, option.Rule{
+				Type: C.RuleTypeDefault,
+				DefaultOptions: option.DefaultRule{
+					RawDefaultRule: option.RawDefaultRule{RuleSet: []string{setTag}},
+					RuleAction:     routeAction(lane),
 				},
 			})
 		}
