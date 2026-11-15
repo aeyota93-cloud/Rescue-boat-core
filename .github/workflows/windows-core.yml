@@ -3,6 +3,7 @@
 #  - push в main: сборка, архив в артефакте запуска 7 дней;
 #  - тег vX.Y.Z[-...]: то же плюс релиз с hiddify-lib-windows-amd64.tar.gz.
 #    Приложение (Rescue-boat) скачивает ядро из этого релиза: core.version в dependencies.properties.
+#    Архив содержит: hiddify-core.dll, HiddifyCli.exe (без libcronet.dll — Naive убран).
 name: Windows core
 
 on:
@@ -52,14 +53,14 @@ jobs:
 
       - name: Архив
         working-directory: bin
-        # Makefile Hiddify (.ONESHELL без set -e) не останавливается на ошибке внутри рецепта:
-        # в v4.1.0-rb.4 сорвалось скачивание libcronet.dll, а релиз вышел без него.
+        # Makefile Hiddify (.ONESHELL без set -e) не останавливается на ошибке внутри рецепта,
+        # поэтому проверяем, что оба файла есть и не пустые. libcronet.dll больше нет: Naive убран.
         run: |
-          for f in hiddify-core.dll libcronet.dll HiddifyCli.exe; do
+          for f in hiddify-core.dll HiddifyCli.exe; do
             [ -s "$f" ] || { echo "::error::нет $f — сборка ядра неполная"; exit 1; }
           done
           mkdir -p ../out
-          tar -czvf ../out/hiddify-lib-windows-amd64.tar.gz ./hiddify-core.dll ./libcronet.dll ./HiddifyCli.exe
+          tar -czvf ../out/hiddify-lib-windows-amd64.tar.gz ./hiddify-core.dll ./HiddifyCli.exe
 
       - uses: actions/upload-artifact@v6
         with:

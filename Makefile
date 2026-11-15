@@ -15,6 +15,12 @@ TAGS=with_gvisor,with_quic,with_wireguard,with_utls,with_clash_api,with_grpc,wit
 IOS_ADD_TAGS=with_dhcp,with_low_memory,with_purego
 MACOS_ADD_TAGS=with_dhcp
 WINDOWS_ADD_TAGS=with_purego
+# Шлюпка: Windows-сборка без Naive (libcronet). TAGS — через запятую, а filter-out работает
+# со списком через пробел: запятые -> пробелы, убрать метку, пробелы -> запятые.
+comma:=,
+empty:=
+space:=$(empty) $(empty)
+WINDOWS_TAGS=$(subst $(space),$(comma),$(filter-out with_naive_outbound,$(subst $(comma),$(space),$(TAGS))))
 LDFLAGS=-w -s -checklinkname=0 -buildid= $${CODE_VERSION}
 GOBUILDLIB=CGO_ENABLED=1 go build -trimpath -ldflags="$(LDFLAGS)" -buildmode=c-shared
 GOBUILDSRV=CGO_ENABLED=1 go build -ldflags="$(LDFLAGS)" -trimpath -tags $(TAGS)
@@ -67,16 +73,14 @@ webui:
 .PHONY: build
 windows-amd64: prepare
 	rm -rf $(BINDIR)/*
-	# Шлюпка: загрузка libcronet иногда тихо не удаётся — до трёх попыток, пока файл не появится.
-	for i in 1 2 3; do go run -v "github.com/sagernet/cronet-go/cmd/build-naive@$(CRONET_GO_VERSION)" extract-lib --target windows/amd64 -o $(BINDIR)/ && [ -s $(BINDIR)/libcronet.dll ] && break; echo "libcronet: попытка $$i не удалась"; sleep 15; done
-	env GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc  $(GOBUILDLIB) -tags $(TAGS),$(WINDOWS_ADD_TAGS)   -o $(BINDIR)/$(LIBNAME).dll ./platform/desktop
+	env GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc  $(GOBUILDLIB) -tags $(WINDOWS_TAGS),$(WINDOWS_ADD_TAGS)   -o $(BINDIR)/$(LIBNAME).dll ./platform/desktop
 	echo "core built, now building cli" 
 	ls -R $(BINDIR)/
 	go install -mod=readonly github.com/akavel/rsrc@latest ||echo "rsrc error in installation"
 	go run ./cli tunnel exit
 	cp $(BINDIR)/$(LIBNAME).dll ./$(LIBNAME).dll
 	$$(go env GOPATH)/bin/rsrc -ico ./assets/hiddify-cli.ico -o ./cmd/bydll/cli.syso ||echo "rsrc error in syso"
-	env GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CGO_LDFLAGS="$(LIBNAME).dll" $(GOBUILDSRV) -o $(BINDIR)/$(CLINAME).exe ./cmd/bydll
+	env GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CGO_LDFLAGS="$(LIBNAME).dll" CGO_ENABLED=1 go build -ldflags="$(LDFLAGS)" -trimpath -tags $(WINDOWS_TAGS) -o $(BINDIR)/$(CLINAME).exe ./cmd/bydll
 	rm ./*.dll
 	if [ ! -f $(BINDIR)/$(LIBNAME).dll -o ! -f $(BINDIR)/$(CLINAME).exe ]; then \
 		echo "Error: $(LIBNAME).dll or $(CLINAME).exe not built"; \
