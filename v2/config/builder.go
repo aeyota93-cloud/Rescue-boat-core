@@ -1008,6 +1008,8 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions, input *opt
 			},
 		})
 	}
+	// Шлюпка: записи групп, которые идут в VPN, — своим соединением (lanes.go).
+	routeRules = split.lanes.applyLanes(routeRules, OutboundMainDetour)
 	options.Route = &option.RouteOptions{
 		Rules:               routeRules,
 		Final:               OutboundMainDetour,

@@ -35,6 +35,7 @@ type rescueRules struct {
 	dns         []option.DefaultDNSRule
 	ruleSets    []option.RuleSet
 	findProcess bool
+	lanes       lanes // полосы групп (только у split_tunnel)
 }
 
 func (r *rescueRules) add(o rescueRules) {
