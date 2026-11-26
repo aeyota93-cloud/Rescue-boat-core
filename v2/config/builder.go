@@ -473,6 +473,8 @@ func setInbound(options *option.Options, hopt *HiddifyOptions) {
 		// default:
 
 		// }
+		// Шлюпка: адреса мимо туннеля (tun_exclude.go).
+		opts.RouteExcludeAddress = tunExcludeAddresses(hopt.SplitTunnelDir)
 		opts.Address = []netip.Prefix{netip.MustParsePrefix("172.19.0.1/28")}
 		if ipv6Enable {
 			opts.Address = append(opts.Address, netip.MustParsePrefix("fdfe:dcba:9876::1/126"))
